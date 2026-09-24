@@ -4,9 +4,9 @@
 
 ### SQLite-backed Runtime + optional Store API + ESABI ExternalObject adapter
 
-[![Version](https://img.shields.io/badge/version-0.1.0--dev-orange)](#status)
+[![Version](https://img.shields.io/badge/version-0.1.0-orange)](#status)
 [![SQLite](https://img.shields.io/badge/SQLite-3.53.4-blue)](https://www.sqlite.org/)
-[![C ABI](https://img.shields.io/badge/API-C%20ABI%20%2B%20C%2B%2B17-success)](#native-api)
+[![C ABI](https://img.shields.io/badge/API-C%20ABI%20%2B%20C%2B%2B11%2B-success)](#native-api)
 [![ExtendScript](https://img.shields.io/badge/Illustrator%2030.6-live%20validated-success)](#extendscript)
 [![Compression](https://img.shields.io/badge/compression-qualification%20pending-lightgrey)](docs/COMPRESSION.md)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -98,14 +98,14 @@ ESDB is **not** "SQLite exposed to ExtendScript." SQLite is the durable kernel; 
 
 - pinned SQLite 3.53.4;
 - stable opaque-handle C ABI;
-- move-only C++17 RAII facade;
+- move-only C++11+ RAII facade;
 - explicit open/journal/synchronous/cache policies;
 - transactions and LIFO savepoints;
 - product-owned schema migrations using PRAGMA user_version;
 - integrity and online backup APIs;
 - backend capability and database health snapshots;
 - optional typed Store with durable revisions/change polling;
-- ESABI v0.3-compatible ExternalObject adapter;
+- ESABI 0.3.1 ExternalObject adapter;
 - minimal ES3-safe JSX facade with explicit unload lifecycle;
 - native and adapter smoke/hardening tests;
 - live Illustrator 30.6.0 / ExtendScript 4.5.6 facade validation.
@@ -233,19 +233,23 @@ $.writeln(db.dataVersion());
 db.close();
 ~~~
 
-The JSX file passes the shared ESTC ES3 static check and live compile-only parse gate. The current build was also exercised end-to-end inside Illustrator 30.6.0 / ExtendScript 4.5.6: absolute-path DLL load, version queries, database open, health/data-version queries, close, zero-handle verification, and unload all passed.
+The JSX file passes the shared ESTC ES3 static check and live compile-only parse gate. The current build was also exercised end-to-end inside Illustrator 30.6.0 / ExtendScript 4.5.6 using a uniquely named temporary DLL copy: missing-library recovery, version queries, database open, health/data-version queries, guarded unload, stale-handle rejection, close, zero-handle verification, and final unload all passed.
 
 `ESDB.unload()` refuses to unload while adapter database handles remain open. The ExternalObject adapter does not expose arbitrary SQL, asynchronous JSX callbacks, raw INT64 as a JavaScript Number, or arbitrary bytes through the string channel.
 
 ## Build
 
-### Fetch/verify SQLite
+### Vendored/verified SQLite
 
-~~~powershell
-pwsh -File tools/fetch-sqlite.ps1
+SQLite 3.53.4 is vendored in `third_party/sqlite`, so a fresh checkout is buildable without a system SQLite or a network fetch. Every CMake configure verifies the vendored `sqlite3.c`, `sqlite3.h`, and `sqlite3ext.h` against the canonical SHA-256 file hashes in `cmake/sqlite-pin.json`.
+
+The same pin records SQLite's upstream amalgamation URL and SHA3-256 archive digest. To verify the vendored tree or repair it from upstream on any platform:
+
+~~~text
+cmake -P tools/fetch-sqlite.cmake
 ~~~
 
-The script pins SQLite 3.53.4 and verifies the downloaded amalgamation against its recorded SHA3-256 digest before installation.
+Force a verified re-download with `-DESDB_SQLITE_FORCE=ON`. `tools/fetch-sqlite.ps1` is a Windows convenience wrapper over the same CMake script, not a second dependency definition.
 
 ### Visual Studio preset
 
@@ -255,13 +259,13 @@ cmake --build --preset vs2022-x64-release
 ctest --preset vs2022-x64-release
 ~~~
 
-ESDB_BUILD_EXTERNALOBJECT=ON builds ESDB.dll on Windows and resolves ESABI from an installed package, ESDB_ESABI_SOURCE_DIR, the sibling ../esabi checkout, or finally the pinned v0.3.0 repository.
+ESDB_BUILD_EXTERNALOBJECT=ON builds ESDB.dll on Windows and resolves ESABI 0.3.1 from an exact installed package, ESDB_ESABI_SOURCE_DIR, the sibling ../esabi checkout, or finally the ESABI v0.3.1 release commit `65c9c3ce627a26a89d6bf90547678841df0cf981`. Windows Release native artifacts use MSVC reproducibility flags, and CPack ZIP timestamps are fixed through the release-specific `SOURCE_DATE_EPOCH`; CI checks that two package generations are byte-identical.
 
 ## Validation
 
-Current automated coverage includes C/C++ smoke, transactions, rollback, savepoints, migration rollback, canonical Store values, revision continuity after full prune and reopen, signed-64 revision bounds, concurrent Store mutation serialization, change-window semantics, subscription polling, C++ callback containment, integrity/backup, backend capabilities, generation-tagged ExternalObject handles, and thread-local adapter staging.
+Current automated coverage includes C/C++ smoke, strict open-option validation and configuration readback, transactions, rollback, savepoints, migration rollback, canonical Store values, semantic Store corruption detection, revision metadata/sequence consistency, revision continuity after full prune and reopen, signed-64 revision bounds, read-only Store access, concurrent Store writer serialization, simultaneous same-connection Store readers/writers, coherent change-window snapshots, subscription reentrancy/BUSY handling, abrupt-process WAL recovery, two-process concurrent WAL writers, C++ callback containment, integrity/backup, backend capabilities, generation-tagged ExternalObject handles, and thread-local adapter staging.
 
-Illustrator 30.6.0 / ExtendScript 4.5.6 additionally passes the live ESTC parser gate and an end-to-end facade/DLL lifecycle smoke. Crash-injection and broader multi-process qualification remain future backend/release evidence. The exact evidence and qualification boundaries are preserved in [docs/RELEASE-VALIDATION.md](docs/RELEASE-VALIDATION.md).
+Illustrator 30.6.0 / ExtendScript 4.5.6 additionally passes the live ESTC parser gate and an end-to-end facade/DLL lifecycle smoke. ESDB now has first smoke-level abrupt-process recovery and two-process WAL-writer evidence; a broader fault-injection matrix and longer multi-process qualification remain future backend/release evidence. The exact evidence and qualification boundaries are preserved in [docs/RELEASE-VALIDATION.md](docs/RELEASE-VALIDATION.md).
 
 ## Compression
 
@@ -292,7 +296,7 @@ esdb/
 - The JSX facade is lifecycle/health-only; the full Store API is not exposed through ExternalObject yet.
 - Change-log pruning is explicit; v0.1 does not synthesize a revision-gap event for consumers that request history already pruned.
 - A database must outlive its transaction/savepoint/subscription handles.
-- FULLMUTEX protects SQLite connection calls, but multi-call logical transaction sequences still require application-level serialization.
+- FULLMUTEX protects individual SQLite connection calls, and ESDB serializes Store mutations plus invariant-sensitive Store reads, but multi-call application transaction sequences still require application-level serialization.
 - Live Illustrator runtime behavior is currently qualified on Illustrator 30.6.0 / ExtendScript 4.5.6 only; other host versions still require their own compatibility evidence.
 
 ## License

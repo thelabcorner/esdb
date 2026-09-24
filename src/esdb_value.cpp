@@ -162,25 +162,29 @@ void esdb_value_destroy(esdb_value *value) { delete value; }
 esdb_value_type esdb_value_type_of(const esdb_value *value) { return value ? value->type : ESDB_VALUE_NULL; }
 
 esdb_status esdb_value_get_bool(const esdb_value *value, int *out_value) {
-    if (!value || !out_value || value->type != ESDB_VALUE_BOOL || value->payload.size() != 1) return ESDB_ERR_TYPE_MISMATCH;
+    if (!value || !out_value) return ESDB_ERR_INVALID_ARGUMENT;
+    if (value->type != ESDB_VALUE_BOOL || value->payload.size() != 1) return ESDB_ERR_TYPE_MISMATCH;
     *out_value = value->payload[0] ? 1 : 0;
     return ESDB_OK;
 }
 
 esdb_status esdb_value_get_int32(const esdb_value *value, int32_t *out_value) {
-    if (!value || !out_value || value->type != ESDB_VALUE_INT32 || value->payload.size() != 4) return ESDB_ERR_TYPE_MISMATCH;
+    if (!value || !out_value) return ESDB_ERR_INVALID_ARGUMENT;
+    if (value->type != ESDB_VALUE_INT32 || value->payload.size() != 4) return ESDB_ERR_TYPE_MISMATCH;
     *out_value = static_cast<int32_t>(read_le32(value->payload));
     return ESDB_OK;
 }
 
 esdb_status esdb_value_get_int64(const esdb_value *value, int64_t *out_value) {
-    if (!value || !out_value || value->type != ESDB_VALUE_INT64 || value->payload.size() != 8) return ESDB_ERR_TYPE_MISMATCH;
+    if (!value || !out_value) return ESDB_ERR_INVALID_ARGUMENT;
+    if (value->type != ESDB_VALUE_INT64 || value->payload.size() != 8) return ESDB_ERR_TYPE_MISMATCH;
     *out_value = static_cast<int64_t>(read_le64(value->payload));
     return ESDB_OK;
 }
 
 esdb_status esdb_value_get_double(const esdb_value *value, double *out_value) {
-    if (!value || !out_value || value->type != ESDB_VALUE_DOUBLE || value->payload.size() != 8) return ESDB_ERR_TYPE_MISMATCH;
+    if (!value || !out_value) return ESDB_ERR_INVALID_ARGUMENT;
+    if (value->type != ESDB_VALUE_DOUBLE || value->payload.size() != 8) return ESDB_ERR_TYPE_MISMATCH;
     const std::uint64_t bits = read_le64(value->payload);
     std::memcpy(out_value, &bits, sizeof(bits));
     return ESDB_OK;

@@ -68,6 +68,29 @@ static int throwing_change(const esdb_change *, void *) {
     throw std::runtime_error("intentional callback fault");
 }
 
+struct ReentrantPoll {
+    esdb_subscription *subscription = nullptr;
+    esdb_status nested_status = ESDB_OK;
+    esdb_status nested_error_status = ESDB_OK;
+    uint32_t callbacks = 0u;
+};
+
+static int reentrant_poll_change(const esdb_change *change, void *user) {
+    auto *context = static_cast<ReentrantPoll *>(user);
+    CHECK(change != nullptr);
+    ++context->callbacks;
+
+    ChangeCount nested_changes{};
+    uint32_t nested_delivered = 0u;
+    esdb_error nested_error{};
+    context->nested_status = esdb_subscription_poll(
+        context->subscription, 1u, count_change, &nested_changes,
+        &nested_delivered, &nested_error);
+    context->nested_error_status = nested_error.status;
+    CHECK(nested_delivered == 0u);
+    return 1;
+}
+
 static void check_value_roundtrip(
     esdb_database *db,
     const char *key,
@@ -87,8 +110,10 @@ static void check_value_roundtrip(
 int main() {
     const std::string path = "esdb-hardening.sqlite";
     const std::string migration_path = "esdb-hardening-migration.sqlite";
+    const std::string empty_path = "esdb-hardening-empty.sqlite";
     cleanup_db(path);
     cleanup_db(migration_path);
+    cleanup_db(empty_path);
 
     esdb_error error{};
     esdb_database *invalid = nullptr;
@@ -118,6 +143,9 @@ int main() {
     esdb_open_options_init(&options);
     options.journal_mode = ESDB_JOURNAL_WAL;
     options.synchronous = ESDB_SYNCHRONOUS_FULL;
+    options.busy_timeout_ms = 4321u;
+    options.cache_kib = 2048u;
+    options.wal_autocheckpoint_pages = 64u;
 
     esdb_open_options bad_options = options;
     bad_options.flags |= (1u << 31);
@@ -137,6 +165,43 @@ int main() {
           ESDB_ERR_INVALID_ARGUMENT);
     CHECK(invalid == nullptr);
 
+    bad_options = options;
+    bad_options.journal_mode = ESDB_JOURNAL_MEMORY;
+    CHECK(esdb_open(":memory:", &bad_options, &invalid, &error) ==
+          ESDB_ERR_INVALID_ARGUMENT);
+    CHECK(invalid == nullptr);
+
+    bad_options = options;
+    bad_options.journal_mode = ESDB_JOURNAL_OFF;
+    CHECK(esdb_open(":memory:", &bad_options, &invalid, &error) ==
+          ESDB_ERR_INVALID_ARGUMENT);
+    CHECK(invalid == nullptr);
+
+    bad_options = options;
+    bad_options.synchronous = ESDB_SYNCHRONOUS_OFF;
+    CHECK(esdb_open(":memory:", &bad_options, &invalid, &error) ==
+          ESDB_ERR_INVALID_ARGUMENT);
+    CHECK(invalid == nullptr);
+
+    bad_options = options;
+    bad_options.journal_mode = 999u;
+    CHECK(esdb_open(":memory:", &bad_options, &invalid, &error) ==
+          ESDB_ERR_INVALID_ARGUMENT);
+    CHECK(invalid == nullptr);
+
+    bad_options = options;
+    bad_options.synchronous = 999u;
+    CHECK(esdb_open(":memory:", &bad_options, &invalid, &error) ==
+          ESDB_ERR_INVALID_ARGUMENT);
+    CHECK(invalid == nullptr);
+
+    /* SQLite cannot honor WAL for :memory:; ESDB must not pretend it did. */
+    bad_options = options;
+    CHECK(esdb_open(":memory:", &bad_options, &invalid, &error) ==
+          ESDB_ERR_UNSUPPORTED);
+    CHECK(invalid == nullptr);
+    CHECK(error.phase == ESDB_PHASE_CONFIGURE);
+
     esdb_database *db = nullptr;
     CHECK(esdb_open(path.c_str(), &options, &db, &error) == ESDB_OK);
     if (!db) return 1;
@@ -145,6 +210,10 @@ int main() {
     esdb_database_health health_before{};
     health_before.struct_size = sizeof(health_before);
     CHECK(esdb_database_health_get(db, &health_before, &error) == ESDB_OK);
+    CHECK(health_before.journal_mode == ESDB_JOURNAL_WAL);
+    CHECK(health_before.synchronous == ESDB_SYNCHRONOUS_FULL);
+    CHECK(health_before.busy_timeout_ms == 4321u);
+    CHECK(health_before.configured_cache_kib == 2048);
     uint64_t ignored_count = 0u;
     CHECK(esdb_store_count(db, "", &ignored_count, &error) == ESDB_ERR_INVALID_ARGUMENT);
     esdb_database_health health_after{};
@@ -161,6 +230,11 @@ int main() {
     esdb_value *one = nullptr;
     CHECK(esdb_value_create_int32(1, &one, &error) == ESDB_OK);
     CHECK(esdb_store_put(db, "tx", "keep", one, nullptr, &error) == ESDB_OK);
+    CHECK(esdb_savepoint_begin(db, "__esdb_mutation", &error) ==
+          ESDB_ERR_INVALID_ARGUMENT);
+    CHECK(esdb_savepoint_begin(db, "__EsDb_Custom", &error) ==
+          ESDB_ERR_INVALID_ARGUMENT);
+    CHECK(esdb_savepoint_depth(db) == 0u);
     CHECK(esdb_savepoint_begin(db, "sp1", &error) == ESDB_OK);
     CHECK(esdb_savepoint_depth(db) == 1u);
     CHECK(esdb_store_put(db, "tx", "rollback", one, nullptr, &error) == ESDB_OK);
@@ -224,6 +298,20 @@ int main() {
 
     CHECK(esdb_value_create_bool(1, &value, &error) == ESDB_OK);
     check_value_roundtrip(db, "bool", value, ESDB_VALUE_BOOL, &error);
+    esdb_value_destroy(value);
+
+    /* Store loads reject semantic payload corruption, not just SQLite corruption. */
+    CHECK(esdb_exec(
+        db,
+        "UPDATE __esdb_records SET value=x'02' "
+        "WHERE key='bool' AND store_id=(SELECT id FROM __esdb_stores WHERE name='typed');",
+        &error) == ESDB_OK);
+    value = nullptr;
+    CHECK(esdb_store_get(db, "typed", "bool", &value, &error) == ESDB_ERR_CORRUPT);
+    CHECK(value == nullptr);
+    CHECK(error.status == ESDB_ERR_CORRUPT);
+    CHECK(esdb_value_create_bool(1, &value, &error) == ESDB_OK);
+    CHECK(esdb_store_put(db, "typed", "bool", value, nullptr, &error) == ESDB_OK);
     esdb_value_destroy(value);
 
     CHECK(esdb_value_create_int32(-1234567, &value, &error) == ESDB_OK);
@@ -294,6 +382,22 @@ int main() {
     uint64_t before_prune = 0u;
     CHECK(esdb_store_revision(db, &before_prune, &error) == ESDB_OK);
     CHECK(before_prune > 0u);
+
+    CHECK(esdb_exec(
+        db,
+        "UPDATE __esdb_meta SET value='not-a-revision' WHERE key='store_revision';",
+        &error) == ESDB_OK);
+    uint64_t corrupt_revision = 0u;
+    CHECK(esdb_store_revision(db, &corrupt_revision, &error) == ESDB_ERR_CORRUPT);
+    CHECK(error.status == ESDB_ERR_CORRUPT);
+    CHECK(esdb_exec(
+        db,
+        "UPDATE __esdb_meta SET value=CAST((SELECT seq FROM sqlite_sequence "
+        "WHERE name='__esdb_changes') AS TEXT) WHERE key='store_revision';",
+        &error) == ESDB_OK);
+    CHECK(esdb_store_revision(db, &corrupt_revision, &error) == ESDB_OK);
+    CHECK(corrupt_revision == before_prune);
+
     uint64_t pruned = 0u;
     CHECK(esdb_store_prune_changes(db, before_prune, &pruned, &error) == ESDB_OK);
     CHECK(pruned > 0u);
@@ -362,6 +466,44 @@ int main() {
         db, "concurrent", &concurrent_count, &error) == ESDB_OK);
     CHECK(concurrent_count == static_cast<uint64_t>(total_writes));
 
+    /*
+     * Shared-connection Store readers must never observe the writer's
+     * multi-statement change/record/revision sequence half-applied.
+     */
+    constexpr int rw_writes = 160;
+    std::atomic<bool> rw_stop{false};
+    std::atomic<int> rw_errors{0};
+    CHECK(esdb_value_create_int32(123, &value, &error) == ESDB_OK);
+    std::vector<std::thread> readers;
+    for (int reader_index = 0; reader_index < 4; ++reader_index) {
+        readers.emplace_back([&]() {
+            while (!rw_stop.load(std::memory_order_acquire)) {
+                esdb_error reader_error{};
+                uint64_t revision = 0u;
+                uint64_t count = 0u;
+                if (esdb_store_revision(db, &revision, &reader_error) != ESDB_OK ||
+                    esdb_store_count(db, "rw", &count, &reader_error) != ESDB_OK) {
+                    rw_errors.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (int item = 0; item < rw_writes; ++item) {
+        char key[64]{};
+        std::snprintf(key, sizeof(key), "rw-%03d", item);
+        uint64_t revision = 0u;
+        CHECK(esdb_store_put(db, "rw", key, value, &revision, &error) == ESDB_OK);
+        CHECK(revision > 0u);
+    }
+    rw_stop.store(true, std::memory_order_release);
+    for (auto &reader : readers) reader.join();
+    esdb_value_destroy(value);
+    value = nullptr;
+    CHECK(rw_errors.load(std::memory_order_relaxed) == 0);
+    uint64_t rw_count = 0u;
+    CHECK(esdb_store_count(db, "rw", &rw_count, &error) == ESDB_OK);
+    CHECK(rw_count == static_cast<uint64_t>(rw_writes));
+
     /* The public revision domain is SQLite's positive signed-64 rowid range. */
     const uint64_t invalid_revision = std::numeric_limits<uint64_t>::max();
     ChangeCount invalid_changes{};
@@ -399,6 +541,23 @@ int main() {
     CHECK(esdb_store_put(db, "changes", "e", value, &rev_e, &error) == ESDB_OK);
     esdb_value_destroy(value);
 
+    /* Reentrant/concurrent polling of one subscription fails BUSY, not deadlock. */
+    esdb_subscription *reentrant_subscription = nullptr;
+    CHECK(esdb_subscribe(
+        db, "changes", rev_c, &reentrant_subscription, &error) == ESDB_OK);
+    ReentrantPoll reentrant{};
+    reentrant.subscription = reentrant_subscription;
+    uint32_t reentrant_delivered = 0u;
+    CHECK(esdb_subscription_poll(
+        reentrant_subscription, 1u, reentrant_poll_change, &reentrant,
+        &reentrant_delivered, &error) == ESDB_OK);
+    CHECK(reentrant_delivered == 1u);
+    CHECK(reentrant.callbacks == 1u);
+    CHECK(reentrant.nested_status == ESDB_ERR_BUSY);
+    CHECK(reentrant.nested_error_status == ESDB_ERR_BUSY);
+    CHECK(esdb_subscription_revision(reentrant_subscription) == rev_d);
+    esdb_subscription_destroy(reentrant_subscription);
+
     ChangeCount subscription_changes{};
     delivered = 0u;
     CHECK(esdb_subscription_poll(
@@ -416,7 +575,57 @@ int main() {
     CHECK(error.phase == ESDB_PHASE_SUBSCRIPTION);
 
     CHECK(esdb_integrity_check(db, 1, &error) == ESDB_OK);
+    uint64_t revision_before_readonly = 0u;
+    CHECK(esdb_store_revision(db, &revision_before_readonly, &error) == ESDB_OK);
     esdb_close(db);
+    db = nullptr;
+
+    /* Existing Store data remains readable through a read-only Runtime handle. */
+    esdb_open_options read_only_options{};
+    esdb_open_options_init(&read_only_options);
+    read_only_options.flags = ESDB_OPEN_READONLY | ESDB_OPEN_FULLMUTEX;
+    read_only_options.journal_mode = ESDB_JOURNAL_UNCHANGED;
+    read_only_options.synchronous = ESDB_SYNCHRONOUS_UNCHANGED;
+    read_only_options.cache_kib = 0u;
+    read_only_options.wal_autocheckpoint_pages = 0u;
+    esdb_database *read_only_db = nullptr;
+    CHECK(esdb_open(path.c_str(), &read_only_options, &read_only_db, &error) == ESDB_OK);
+    CHECK(read_only_db != nullptr);
+    value = nullptr;
+    CHECK(esdb_store_get(read_only_db, "typed", "i64", &value, &error) == ESDB_OK);
+    CHECK(value != nullptr);
+    esdb_value_destroy(value);
+    value = nullptr;
+    uint64_t read_only_revision = 0u;
+    CHECK(esdb_store_revision(read_only_db, &read_only_revision, &error) == ESDB_OK);
+    CHECK(read_only_revision == revision_before_readonly);
+    CHECK(esdb_store_ensure(read_only_db, "typed", &error) == ESDB_OK);
+    CHECK(esdb_store_ensure(read_only_db, "missing-store", &error) == ESDB_ERR_IO);
+    CHECK(error.status == ESDB_ERR_IO);
+    CHECK(error.sqlite_code != 0);
+    CHECK(esdb_value_create_int32(123, &value, &error) == ESDB_OK);
+    CHECK(esdb_store_put(
+        read_only_db, "typed", "readonly-write", value, nullptr, &error) == ESDB_ERR_IO);
+    CHECK(error.status == ESDB_ERR_IO);
+    CHECK(error.sqlite_code != 0);
+    esdb_value_destroy(value);
+    value = nullptr;
+    uint64_t readonly_pruned = 0u;
+    CHECK(esdb_store_prune_changes(
+        read_only_db, read_only_revision, &readonly_pruned, &error) == ESDB_ERR_IO);
+    CHECK(readonly_pruned == 0u);
+    esdb_close(read_only_db);
+
+    /* A read-only database without Store schema reports absence, not a write error. */
+    esdb_database *empty_db = nullptr;
+    CHECK(esdb_open(empty_path.c_str(), &options, &empty_db, &error) == ESDB_OK);
+    CHECK(empty_db != nullptr);
+    esdb_close(empty_db);
+    empty_db = nullptr;
+    CHECK(esdb_open(empty_path.c_str(), &read_only_options, &empty_db, &error) == ESDB_OK);
+    CHECK(esdb_store_revision(empty_db, &read_only_revision, &error) == ESDB_ERR_NOT_FOUND);
+    CHECK(error.status == ESDB_ERR_NOT_FOUND);
+    esdb_close(empty_db);
 
     /* Migration failure rolls back all steps and user_version atomically. */
     esdb_database *migration_db = nullptr;
@@ -440,6 +649,7 @@ int main() {
 
     cleanup_db(path);
     cleanup_db(migration_path);
+    cleanup_db(empty_path);
 
     if (failures != 0) {
         std::fprintf(stderr, "%d ESDB hardening checks failed\n", failures);

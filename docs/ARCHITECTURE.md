@@ -88,7 +88,7 @@ ESDB_OPEN_FULLMUTEX is the default and permits SQLite calls on a connection from
 
 ESDB_OPEN_NOMUTEX requires external serialization of all use of that connection.
 
-ESDB Store additionally serializes complete Store write mutations per connection. This removes connection-global result races and prevents ESDB Store savepoint sequences from interleaving with each other; it does not replace application-level transaction ownership.
+ESDB Store serializes complete Store mutations per connection and serializes invariant-sensitive reads against those writers. Standalone Store mutations begin with `BEGIN IMMEDIATE`, so SQLite's configured busy handler arbitrates the writer slot before mutation work begins; inside an existing transaction ESDB uses an internal savepoint. Change queries snapshot their bounded result set under the Store mutex and invoke callbacks only after releasing it. This removes connection-global result races, prevents Store transaction sequences from interleaving, and prevents readers from observing a change/record/revision sequence half-applied; it does not replace application-level transaction ownership.
 
 No operation may race esdb_close. Database handles must outlive transaction/savepoint/subscription handles.
 
@@ -96,7 +96,7 @@ For cross-process access, behavior is SQLite's behavior for the selected journal
 
 ## Durability policy
 
-ESDB open options reject journal_mode=OFF and synchronous=OFF.
+ESDB rejects explicit `journal_mode=MEMORY`, `journal_mode=OFF`, and `synchronous=OFF` requests. Unknown enum values and nonzero reserved option fields are rejected before opening. When a journal/synchronous/cache/WAL-autocheckpoint policy is explicitly requested, ESDB reads the corresponding pragma back and requires SQLite to have applied that exact setting; a backend/path that cannot honor it fails configuration instead of silently degrading it. `UNCHANGED` remains available for callers intentionally inheriting the existing database/backend mode.
 
 Native callers may intentionally bypass policy through the SQLite escape hatch, but health reporting reflects the observed configuration.
 
@@ -115,7 +115,7 @@ esdb_backend_capabilities makes storage assumptions explicit:
 - backup/savepoint/URI support;
 - compression capability and codec metadata.
 
-v0.1 reports plain SQLite, no compression, and stock-tool compatibility.
+v0.1 reports plain SQLite, no compression, and stock-tool compatibility. The exact SQLite 3.53.4 amalgamation is vendored in the source tree and its three source/header files are SHA-256 verified by CMake at configure time against the canonical release pin.
 
 ## Error model
 

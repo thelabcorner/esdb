@@ -298,7 +298,26 @@ bool valid_savepoint_name(const char *text) noexcept {
         if (!allowed) return false;
         if (++length > ESDB_SAVEPOINT_NAME_MAX_BYTES) return false;
     }
-    return length > 0;
+    if (length == 0) return false;
+
+    /*
+     * SQLite identifiers are case-insensitive. Reserve __esdb_* so public
+     * savepoints cannot collide with Store's internal transactional scopes.
+     */
+    static const char reserved[] = "__esdb_";
+    if (length >= sizeof(reserved) - 1u) {
+        bool matches = true;
+        for (std::size_t i = 0; i < sizeof(reserved) - 1u; ++i) {
+            unsigned char c = static_cast<unsigned char>(text[i]);
+            if (c >= 'A' && c <= 'Z') c = static_cast<unsigned char>(c - 'A' + 'a');
+            if (c != static_cast<unsigned char>(reserved[i])) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return false;
+    }
+    return true;
 }
 
 std::int64_t unix_time_ms() noexcept {
@@ -502,6 +521,36 @@ static bool valid_open_flags(esdb_open_flags flags) {
     return true;
 }
 
+static esdb_journal_mode parse_journal_mode(const char *text);
+
+static bool valid_journal_request(esdb_journal_mode mode) noexcept {
+    switch (mode) {
+        case ESDB_JOURNAL_UNCHANGED:
+        case ESDB_JOURNAL_DELETE:
+        case ESDB_JOURNAL_TRUNCATE:
+        case ESDB_JOURNAL_PERSIST:
+        case ESDB_JOURNAL_WAL:
+            return true;
+        case ESDB_JOURNAL_MEMORY:
+        case ESDB_JOURNAL_OFF:
+        default:
+            return false;
+    }
+}
+
+static bool valid_synchronous_request(esdb_synchronous_mode mode) noexcept {
+    switch (mode) {
+        case ESDB_SYNCHRONOUS_UNCHANGED:
+        case ESDB_SYNCHRONOUS_NORMAL:
+        case ESDB_SYNCHRONOUS_FULL:
+        case ESDB_SYNCHRONOUS_EXTRA:
+            return true;
+        case ESDB_SYNCHRONOUS_OFF:
+        default:
+            return false;
+    }
+}
+
 static const char *journal_mode_sql(esdb_journal_mode mode) {
     switch (mode) {
         case ESDB_JOURNAL_DELETE: return "PRAGMA journal_mode=DELETE;";
@@ -539,11 +588,23 @@ static esdb_status configure_database(esdb_database *database, const esdb_open_o
         database, options.foreign_keys ? "PRAGMA foreign_keys=ON;" : "PRAGMA foreign_keys=OFF;",
         ESDB_PHASE_CONFIGURE, error);
     if (status != ESDB_OK) return status;
+    std::int64_t actual_foreign_keys = -1;
+    status = esdb_detail::query_i64(
+        database, "PRAGMA foreign_keys;", &actual_foreign_keys,
+        ESDB_PHASE_CONFIGURE, error);
+    if (status != ESDB_OK) return status;
+    if (actual_foreign_keys != static_cast<std::int64_t>(options.foreign_keys)) {
+        return esdb_detail::fail(
+            database, error, ESDB_ERR_UNSUPPORTED, ESDB_PHASE_CONFIGURE,
+            database->handle, SQLITE_MISMATCH,
+            "requested foreign_keys mode could not be applied exactly");
+    }
 
-    if (options.journal_mode == ESDB_JOURNAL_OFF) {
+    if (options.journal_mode == ESDB_JOURNAL_OFF ||
+        options.journal_mode == ESDB_JOURNAL_MEMORY) {
         return esdb_detail::fail(database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_CONFIGURE,
                                  database->handle, SQLITE_MISUSE,
-                                 "journal_mode=OFF is not supported by the ESDB durability policy");
+                                 "non-durable journal mode is not supported by the ESDB durability policy");
     }
     const char *journal = journal_mode_sql(options.journal_mode);
     if (options.journal_mode != ESDB_JOURNAL_UNCHANGED) {
@@ -553,6 +614,24 @@ static esdb_status configure_database(esdb_database *database, const esdb_open_o
         }
         status = esdb_detail::exec_sql(database, journal, ESDB_PHASE_CONFIGURE, error);
         if (status != ESDB_OK) return status;
+
+        esdb_detail::Statement journal_query;
+        status = journal_query.prepare(
+            database, "PRAGMA journal_mode;", ESDB_PHASE_CONFIGURE, error);
+        if (status != ESDB_OK) return status;
+        int step = 0;
+        status = journal_query.step(database, &step, ESDB_PHASE_CONFIGURE, error);
+        if (status != ESDB_OK) return status;
+        const char *actual_text = step == SQLITE_ROW
+            ? reinterpret_cast<const char *>(sqlite3_column_text(journal_query.get(), 0))
+            : nullptr;
+        const esdb_journal_mode actual = parse_journal_mode(actual_text);
+        if (actual != options.journal_mode) {
+            return esdb_detail::fail(
+                database, error, ESDB_ERR_UNSUPPORTED, ESDB_PHASE_CONFIGURE,
+                database->handle, SQLITE_MISMATCH,
+                "requested journal mode could not be applied exactly");
+        }
     }
 
     if (options.synchronous == ESDB_SYNCHRONOUS_OFF) {
@@ -568,6 +647,21 @@ static esdb_status configure_database(esdb_database *database, const esdb_open_o
         }
         status = esdb_detail::exec_sql(database, synchronous, ESDB_PHASE_CONFIGURE, error);
         if (status != ESDB_OK) return status;
+
+        std::int64_t actual_synchronous = -1;
+        status = esdb_detail::query_i64(
+            database, "PRAGMA synchronous;", &actual_synchronous,
+            ESDB_PHASE_CONFIGURE, error);
+        if (status != ESDB_OK) return status;
+        const std::int64_t expected_synchronous =
+            options.synchronous == ESDB_SYNCHRONOUS_NORMAL ? 1 :
+            options.synchronous == ESDB_SYNCHRONOUS_FULL ? 2 : 3;
+        if (actual_synchronous != expected_synchronous) {
+            return esdb_detail::fail(
+                database, error, ESDB_ERR_UNSUPPORTED, ESDB_PHASE_CONFIGURE,
+                database->handle, SQLITE_MISMATCH,
+                "requested synchronous mode could not be applied exactly");
+        }
     }
 
     if (options.cache_kib > 0) {
@@ -575,6 +669,17 @@ static esdb_status configure_database(esdb_database *database, const esdb_open_o
         std::snprintf(sql, sizeof(sql), "PRAGMA cache_size=-%u;", options.cache_kib);
         status = esdb_detail::exec_sql(database, sql, ESDB_PHASE_CONFIGURE, error);
         if (status != ESDB_OK) return status;
+        std::int64_t actual_cache = 0;
+        status = esdb_detail::query_i64(
+            database, "PRAGMA cache_size;", &actual_cache,
+            ESDB_PHASE_CONFIGURE, error);
+        if (status != ESDB_OK) return status;
+        if (actual_cache != -static_cast<std::int64_t>(options.cache_kib)) {
+            return esdb_detail::fail(
+                database, error, ESDB_ERR_UNSUPPORTED, ESDB_PHASE_CONFIGURE,
+                database->handle, SQLITE_MISMATCH,
+                "requested cache size could not be applied exactly");
+        }
     }
 
     if (options.wal_autocheckpoint_pages > 0) {
@@ -582,6 +687,17 @@ static esdb_status configure_database(esdb_database *database, const esdb_open_o
         std::snprintf(sql, sizeof(sql), "PRAGMA wal_autocheckpoint=%u;", options.wal_autocheckpoint_pages);
         status = esdb_detail::exec_sql(database, sql, ESDB_PHASE_CONFIGURE, error);
         if (status != ESDB_OK) return status;
+        std::int64_t actual_autocheckpoint = 0;
+        status = esdb_detail::query_i64(
+            database, "PRAGMA wal_autocheckpoint;", &actual_autocheckpoint,
+            ESDB_PHASE_CONFIGURE, error);
+        if (status != ESDB_OK) return status;
+        if (actual_autocheckpoint != static_cast<std::int64_t>(options.wal_autocheckpoint_pages)) {
+            return esdb_detail::fail(
+                database, error, ESDB_ERR_UNSUPPORTED, ESDB_PHASE_CONFIGURE,
+                database->handle, SQLITE_MISMATCH,
+                "requested WAL autocheckpoint could not be applied exactly");
+        }
     }
 
     return ESDB_OK;
@@ -608,6 +724,16 @@ esdb_status esdb_open(const char *path_utf8, const esdb_open_options *options, e
     if (!valid_open_flags(resolved.flags)) {
         esdb_detail::set_error(error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_OPEN, nullptr, SQLITE_MISUSE,
                                "invalid or unknown open flags");
+        return ESDB_ERR_INVALID_ARGUMENT;
+    }
+    if (!valid_journal_request(resolved.journal_mode)) {
+        esdb_detail::set_error(error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_OPEN, nullptr, SQLITE_MISUSE,
+                               "invalid, unknown, or non-durable journal mode");
+        return ESDB_ERR_INVALID_ARGUMENT;
+    }
+    if (!valid_synchronous_request(resolved.synchronous)) {
+        esdb_detail::set_error(error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_OPEN, nullptr, SQLITE_MISUSE,
+                               "invalid, unknown, or non-durable synchronous mode");
         return ESDB_ERR_INVALID_ARGUMENT;
     }
     if (resolved.foreign_keys > 1u) {

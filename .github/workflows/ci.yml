@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  posix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure core
+        run: cmake -S . -B build -DESDB_BUILD_TESTS=ON -DESDB_BUILD_EXTERNALOBJECT=OFF -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Install
+        run: cmake --install build --prefix "${{ github.workspace }}/install"
+
+      - name: Configure installed-package consumer
+        run: cmake -S tests/package_consumer -B consumer-build -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install" -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build installed-package consumer
+        run: cmake --build consumer-build --parallel
+
+      - name: Run installed-package consumers
+        run: |
+          ./consumer-build/esdb_package_consumer
+          ./consumer-build/esdb_package_consumer_c
+
+      - name: Configure embedded Runtime consumer
+        run: cmake -S tests/embed_consumer -B embed-build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build embedded Runtime consumer
+        run: cmake --build embed-build --parallel
+
+      - name: Run embedded Runtime consumer
+        run: ./embed-build/esdb_embed_consumer
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure x64 Release
+        run: >
+          cmake -S . -B build
+          -G "Visual Studio 17 2022" -A x64
+          -DESDB_BUILD_TESTS=ON
+          -DESDB_BUILD_EXTERNALOBJECT=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Verify ExternalObject exports
+        shell: pwsh
+        run: ./tools/verify-externalobject-exports.ps1 -Dll ./build/Release/ESDB.dll
+
+      - name: Install
+        run: cmake --install build --config Release --prefix "${{ github.workspace }}/install"
+
+      - name: Configure installed-package consumer
+        run: >
+          cmake -S tests/package_consumer -B consumer-build
+          -G "Visual Studio 17 2022" -A x64
+          -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install"
+
+      - name: Build installed-package consumer
+        run: cmake --build consumer-build --config Release --parallel
+
+      - name: Run installed-package consumers
+        shell: pwsh
+        run: |
+          & ./consumer-build/Release/esdb_package_consumer.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./consumer-build/Release/esdb_package_consumer_c.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Configure embedded Runtime consumer
+        run: cmake -S tests/embed_consumer -B embed-build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build embedded Runtime consumer
+        run: cmake --build embed-build --config Release --parallel
+
+      - name: Run embedded Runtime consumer
+        shell: pwsh
+        run: |
+          & ./embed-build/Release/esdb_embed_consumer.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package and verify reproducibility
+        shell: pwsh
+        run: |
+          cpack --config build/CPackConfig.cmake -C Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $package = Get-ChildItem -LiteralPath . -Filter "ESDB-*.zip" | Select-Object -Single
+          $first = (Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash
+          Start-Sleep -Seconds 2
+          cpack --config build/CPackConfig.cmake -C Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $second = (Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash
+          if ($first -ne $second) {
+            throw "CPack ZIP is not reproducible: $first != $second"
+          }
+          "$($package.Name)  $second" | Set-Content -LiteralPath "$($package.FullName).sha256"

@@ -23,6 +23,7 @@ constexpr std::uint32_t k_generation_max =
 struct Slot {
     esdb_database *database = nullptr;
     std::uint32_t generation = 1u;
+    bool retired = false;
 };
 
 struct AdapterError {
@@ -125,15 +126,18 @@ Slot *lookup_slot_unlocked(std::int32_t token) noexcept {
     std::uint32_t generation = 0;
     if (!decode_handle(token, slot_index, generation)) return nullptr;
     Slot &slot = g_slots[slot_index];
-    if (!slot.database || slot.generation != generation) return nullptr;
+    if (slot.retired || !slot.database || slot.generation != generation) return nullptr;
     return &slot;
 }
 
 void advance_generation(Slot &slot) noexcept {
-    ++slot.generation;
-    if (slot.generation == 0u || slot.generation > k_generation_max) {
-        slot.generation = 1u;
+    if (slot.generation >= k_generation_max) {
+        // Never wrap a generation: wrapping could make an ancient stale token
+        // valid again (ABA). Retiring one slot after ~8.4M reuses is safer.
+        slot.retired = true;
+        return;
     }
+    ++slot.generation;
 }
 
 char *duplicate_string(const std::string &text) noexcept {
@@ -190,12 +194,14 @@ const char *journal_name(esdb_journal_mode mode) noexcept {
         case ESDB_JOURNAL_PERSIST: return "persist";
         case ESDB_JOURNAL_MEMORY: return "memory";
         case ESDB_JOURNAL_WAL: return "wal";
+        case ESDB_JOURNAL_OFF: return "off";
         default: return "unchanged";
     }
 }
 
 const char *synchronous_name(esdb_synchronous_mode mode) noexcept {
     switch (mode) {
+        case ESDB_SYNCHRONOUS_OFF: return "off";
         case ESDB_SYNCHRONOUS_NORMAL: return "normal";
         case ESDB_SYNCHRONOUS_FULL: return "full";
         case ESDB_SYNCHRONOUS_EXTRA: return "extra";
@@ -430,7 +436,7 @@ ESABI_DIRECT_FUNCTION(openStaged) {
         std::lock_guard<esdb_detail::NoThrowMutex> lock(g_mutex);
         for (std::uint32_t index = 0; index < k_slot_count; ++index) {
             Slot &slot = g_slots[index];
-            if (!slot.database) {
+            if (!slot.database && !slot.retired) {
                 slot.database = database;
                 clear_last_error_unlocked();
                 esabi_value_set_i32(retval, encode_handle(index, slot.generation));

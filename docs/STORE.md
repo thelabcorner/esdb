@@ -34,21 +34,21 @@ The canonical values are:
 - ESDB_VALUE_ARRAY
 - ESDB_VALUE_OBJECT
 
-Numeric scalar payloads use a canonical little-endian binary representation inside ESDB values before storage.
+Numeric scalar payloads use a canonical little-endian binary representation inside ESDB values before storage. Store reads validate the canonical payload shape again: BOOL must be exactly one byte `0`/`1`, INT32 exactly four bytes, INT64/DOUBLE exactly eight bytes, NULL empty, and structured text valid UTF-8. Semantic payload violations are reported as `ESDB_ERR_CORRUPT` rather than being silently decoded.
 
 UTF-8, arrays, and objects are length-delimited byte payloads. v0.1 validates UTF-8 validity but deliberately does not prescribe a JSON parser.
 
 ## Mutation atomicity
 
-A put/delete operation writes its change journal record, record mutation, and durable revision metadata inside one SQLite savepoint.
+A put/delete operation writes its change journal record, record mutation, and durable revision metadata as one SQLite transaction scope. When the connection is in autocommit mode, ESDB starts `BEGIN IMMEDIATE` before the mutation; this acquires the SQLite writer slot through the configured busy handler before any Store state is read or changed, avoiding deferred read-to-write upgrade races under WAL/multi-process writers. When a caller already owns a transaction, ESDB uses an internal savepoint instead and participates in that outer transaction.
 
-If a caller already owns a transaction, the Store mutation participates in it. Rolling back the outer transaction also rolls back the Store mutation and its revision allocation. A revision returned by put/delete inside that transaction is therefore provisional until the outer commit; a rolled-back revision may later be reused by SQLite.
+Rolling back the outer transaction also rolls back the Store mutation and its revision allocation. A revision returned by put/delete inside that transaction is therefore provisional until the outer commit; a rolled-back revision may later be reused by SQLite.
 
 ## Durable revisions
 
 A revision identifies committed Store change order.
 
-The authoritative current revision is stored in __esdb_meta, not inferred from the maximum surviving change row.
+The authoritative current revision is stored in `__esdb_meta`, not inferred from the maximum surviving change row. ESDB also cross-checks that metadata against SQLite's `sqlite_sequence` entry for `__esdb_changes`; malformed, non-canonical, or inconsistent revision metadata is treated as corruption.
 
 This is necessary because the change log can be pruned.
 
@@ -88,11 +88,17 @@ Polling:
 2. invokes the caller synchronously;
 3. advances the cursor to the last delivered revision on success.
 
-No native worker thread invokes host code.
+No native worker thread invokes host code. The cursor revision is atomically published. Only one poll may be active per subscription: concurrent or callback-reentrant polls on that same subscription return `ESDB_ERR_BUSY` instead of blocking behind the active callback.
 
-Store write calls on the same ESDB connection are serialized internally so a complete put/delete/prune mutation cannot interleave with another ESDB Store writer on that connection. This does not turn an application-level begin -> many calls -> commit sequence into a cross-thread critical section; callers still serialize logical transaction ownership.
+Store operations that depend on the multi-statement record/change/revision invariant serialize against Store writers on the same ESDB connection. A complete put/delete/prune mutation cannot interleave with another Store mutation, and reads such as get/count/revision cannot observe a mutation half-applied. Standalone Store mutations acquire SQLite write ownership with `BEGIN IMMEDIATE`, so the configured busy timeout applies at a deterministic acquisition point; inside a caller-owned transaction they use a reserved internal savepoint. First-use Store schema initialization follows the same rule and rechecks the schema after acquiring write ownership, preventing concurrent processes from racing independent schema creators. Change polling first copies a coherent bounded snapshot while serialized, then releases the Store mutex before invoking callbacks. This does not turn an application-level begin -> many calls -> commit sequence into a cross-thread critical section; callers still serialize logical transaction ownership.
 
 Subscriptions borrow their parent database; destroy them before closing the database.
+
+## Read-only connections
+
+Store reads work through `ESDB_OPEN_READONLY` when the Store schema already exists. Schema discovery on a read-only connection is verification-only: ESDB never attempts `CREATE TABLE` as a side effect of a read.
+
+`esdb_store_ensure()` succeeds for an already-registered store but cannot create a missing store. `put`, mutation-producing `delete`, and change-log pruning require a writable database and fail deterministically on a read-only connection. A read-only database with no ESDB Store schema reports `ESDB_ERR_NOT_FOUND` rather than trying to initialize one.
 
 ## Pruning
 

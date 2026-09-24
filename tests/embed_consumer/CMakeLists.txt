@@ -1,0 +1,21 @@
+cmake_minimum_required(VERSION 3.20)
+project(esdb_embed_consumer LANGUAGES CXX)
+
+add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../.." esdb-dependency)
+
+if(ESDB_BUILD_TESTS)
+    message(FATAL_ERROR "ESDB_BUILD_TESTS must default OFF when ESDB is embedded")
+endif()
+if(ESDB_BUILD_EXTERNALOBJECT)
+    message(FATAL_ERROR "ESDB_BUILD_EXTERNALOBJECT must default OFF when ESDB is embedded")
+endif()
+if(ESDB_INSTALL)
+    message(FATAL_ERROR "ESDB_INSTALL must default OFF when ESDB is embedded")
+endif()
+if(TARGET esdb_externalobject)
+    message(FATAL_ERROR "Embedded Runtime consumer unexpectedly built the ExternalObject adapter")
+endif()
+
+add_executable(esdb_embed_consumer main.cpp)
+target_compile_features(esdb_embed_consumer PRIVATE cxx_std_11)
+target_link_libraries(esdb_embed_consumer PRIVATE ESDB::esdb)

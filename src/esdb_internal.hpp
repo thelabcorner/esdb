@@ -22,6 +22,7 @@ struct esdb_database {
     sqlite3 *handle = nullptr;
     esdb_detail::NoThrowMutex state_mutex;
     esdb_detail::NoThrowMutex error_mutex;
+    esdb_detail::NoThrowMutex store_schema_mutex;
     esdb_detail::NoThrowMutex store_write_mutex;
     bool transaction_active = false;
     esdb_transaction *active_transaction = nullptr;
@@ -51,7 +52,8 @@ struct esdb_subscription {
     esdb_database *database = nullptr;
     char store_name[ESDB_STORE_NAME_MAX_BYTES + 1u]{};
     bool all_stores = true;
-    std::uint64_t revision = 0;
+    std::atomic<std::uint64_t> revision{0u};
+    esdb_detail::NoThrowMutex poll_mutex;
 };
 
 namespace esdb_detail {

@@ -19,13 +19,13 @@ extern "C" {
  *
  * Type mapping rules (see docs/ABI.md "Value and wire mapping"):
  *
- *   ESDB_VALUE_NULL    - SQL NULL.
- *   ESDB_VALUE_BOOL    - SQL INTEGER 0/1.
- *   ESDB_VALUE_INT32   - exact signed 32-bit integer.
- *   ESDB_VALUE_INT64   - exact signed 64-bit integer. This type exists
+ *   ESDB_VALUE_NULL    - semantic null with an empty canonical payload.
+ *   ESDB_VALUE_BOOL    - one canonical byte, 0 or 1.
+ *   ESDB_VALUE_INT32   - exact signed 32-bit integer, little-endian payload.
+ *   ESDB_VALUE_INT64   - exact signed 64-bit integer, little-endian payload. This type exists
  *                        precisely so callers never have to round a 64-bit
  *                        integer through a double.
- *   ESDB_VALUE_DOUBLE  - IEEE-754 binary64.
+ *   ESDB_VALUE_DOUBLE  - IEEE-754 binary64 bit pattern, little-endian payload.
  *   ESDB_VALUE_UTF8    - validated UTF-8 text (no embedded NUL requirement;
  *                        length is explicit).
  *   ESDB_VALUE_BYTES   - arbitrary octets, including embedded NUL.

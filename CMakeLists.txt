@@ -4,60 +4,56 @@ project(ESDB VERSION 0.1.0 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
-include(CTest)
 
 find_package(Threads REQUIRED)
 
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_C_EXTENSIONS OFF)
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+set(_ESDB_TOP_LEVEL OFF)
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    set(_ESDB_TOP_LEVEL ON)
+endif()
+set(_ESDB_EXTERNALOBJECT_DEFAULT OFF)
+if(_ESDB_TOP_LEVEL AND WIN32)
+    set(_ESDB_EXTERNALOBJECT_DEFAULT ON)
+endif()
 
-option(ESDB_BUILD_TESTS "Build ESDB tests" ON)
-option(ESDB_BUILD_EXTERNALOBJECT "Build the ESABI ExternalObject adapter" ${WIN32})
+option(ESDB_BUILD_TESTS "Build ESDB tests" ${_ESDB_TOP_LEVEL})
+option(ESDB_BUILD_EXTERNALOBJECT "Build the ESABI ExternalObject adapter" ${_ESDB_EXTERNALOBJECT_DEFAULT})
+option(ESDB_INSTALL "Generate ESDB install/package rules" ${_ESDB_TOP_LEVEL})
 option(ESDB_SQLITE_ENABLE_API_ARMOR "Enable SQLITE_ENABLE_API_ARMOR" ON)
-option(ESDB_SQLITE_OMIT_LOAD_EXTENSION "Compile SQLite without loadable-extension support" OFF)
 set(ESDB_ESABI_SOURCE_DIR "" CACHE PATH "Optional path to an ESABI source tree")
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/SQLitePin.cmake")
 set(ESDB_SQLITE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite")
-if(NOT EXISTS "${ESDB_SQLITE_DIR}/sqlite3.c" OR NOT EXISTS "${ESDB_SQLITE_DIR}/sqlite3.h")
-    message(FATAL_ERROR
-        "Pinned SQLite amalgamation is missing. Run: "
-        "powershell -ExecutionPolicy Bypass -File tools/fetch-sqlite.ps1")
-endif()
+esdb_verify_sqlite_tree("${ESDB_SQLITE_DIR}")
 
-add_library(esdb_sqlite_obj OBJECT third_party/sqlite/sqlite3.c)
-set_target_properties(esdb_sqlite_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_compile_definitions(esdb_sqlite_obj PRIVATE
-    SQLITE_THREADSAFE=1
-    SQLITE_DEFAULT_FOREIGN_KEYS=1
-    SQLITE_DQS=0
-    SQLITE_ENABLE_DBSTAT_VTAB=1
-    SQLITE_USE_URI=1
+set(_ESDB_SQLITE_SOURCE third_party/sqlite/sqlite3.c)
+set_source_files_properties(${_ESDB_SQLITE_SOURCE} PROPERTIES
+    COMPILE_DEFINITIONS "SQLITE_THREADSAFE=1;SQLITE_DEFAULT_FOREIGN_KEYS=1;SQLITE_DQS=0;SQLITE_ENABLE_DBSTAT_VTAB=1;SQLITE_USE_URI=1"
 )
 if(ESDB_SQLITE_ENABLE_API_ARMOR)
-    target_compile_definitions(esdb_sqlite_obj PRIVATE SQLITE_ENABLE_API_ARMOR=1)
+    set_property(SOURCE ${_ESDB_SQLITE_SOURCE} APPEND PROPERTY
+        COMPILE_DEFINITIONS SQLITE_ENABLE_API_ARMOR=1)
 endif()
-if(ESDB_SQLITE_OMIT_LOAD_EXTENSION)
-    target_compile_definitions(esdb_sqlite_obj PRIVATE SQLITE_OMIT_LOAD_EXTENSION=1)
-endif()
+# Keep SQLite's normal public API surface intact because ESDB installs the
+# matching sqlite3.h for controlled native-handle consumers. ESDB itself never
+# enables extension loading; native callers must opt into SQLite's mechanism.
 if(MSVC)
-    target_compile_definitions(esdb_sqlite_obj PRIVATE _CRT_SECURE_NO_WARNINGS)
-    target_compile_options(esdb_sqlite_obj PRIVATE /W0)
+    set_property(SOURCE ${_ESDB_SQLITE_SOURCE} APPEND PROPERTY
+        COMPILE_DEFINITIONS _CRT_SECURE_NO_WARNINGS)
+    set_property(SOURCE ${_ESDB_SQLITE_SOURCE} APPEND PROPERTY COMPILE_OPTIONS /W0 /Brepro)
 else()
-    target_compile_options(esdb_sqlite_obj PRIVATE -w)
+    set_property(SOURCE ${_ESDB_SQLITE_SOURCE} APPEND PROPERTY COMPILE_OPTIONS -w)
 endif()
 
 add_library(esdb STATIC
     src/esdb_runtime.cpp
     src/esdb_store.cpp
     src/esdb_value.cpp
-    $<TARGET_OBJECTS:esdb_sqlite_obj>
+    ${_ESDB_SQLITE_SOURCE}
 )
 add_library(ESDB::esdb ALIAS esdb)
 
+target_compile_features(esdb PUBLIC cxx_std_11)
 target_link_libraries(esdb PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 
 set_target_properties(esdb PROPERTIES
@@ -76,13 +72,23 @@ target_include_directories(esdb
 
 if(MSVC)
     target_compile_definitions(esdb PRIVATE _CRT_SECURE_NO_WARNINGS)
-    target_compile_options(esdb PRIVATE /W4)
+    target_compile_options(esdb PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/W4>
+        $<$<COMPILE_LANGUAGE:CXX>:/Brepro>
+    )
+    # Suppress archive timestamps; keeping SQLite inside this target also avoids
+    # build-directory paths leaking into archive member names.
+    set_property(TARGET esdb APPEND PROPERTY STATIC_LIBRARY_OPTIONS /Brepro)
 else()
-    target_compile_options(esdb PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(esdb PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>)
+endif()
+
+if(ESDB_BUILD_TESTS)
+    enable_testing()
 endif()
 
 if(ESDB_BUILD_EXTERNALOBJECT)
-    find_package(esabi 0.3 CONFIG QUIET)
+    find_package(esabi 0.3.1 EXACT CONFIG QUIET)
     if(NOT TARGET esabi::esabi)
         if(ESDB_ESABI_SOURCE_DIR)
             add_subdirectory("${ESDB_ESABI_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/_deps/esabi" EXCLUDE_FROM_ALL)
@@ -90,10 +96,10 @@ if(ESDB_BUILD_EXTERNALOBJECT)
             add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../esabi" "${CMAKE_CURRENT_BINARY_DIR}/_deps/esabi" EXCLUDE_FROM_ALL)
         else()
             include(FetchContent)
+            # ESABI 0.3.1, pinned by immutable commit rather than a mutable tag.
             FetchContent_Declare(esabi
                 GIT_REPOSITORY https://github.com/thelabcorner/esabi.git
-                GIT_TAG v0.3.0
-                GIT_SHALLOW TRUE
+                GIT_TAG 65c9c3ce627a26a89d6bf90547678841df0cf981
             )
             FetchContent_MakeAvailable(esabi)
         endif()
@@ -107,7 +113,9 @@ if(ESDB_BUILD_EXTERNALOBJECT)
         ARCHIVE_OUTPUT_NAME "esdb_externalobject"
     )
     if(MSVC)
-        target_compile_options(esdb_externalobject PRIVATE /W4)
+        target_compile_options(esdb_externalobject PRIVATE /W4 /Brepro)
+        # Suppress PE/linker timestamps and other avoidable build-to-build drift.
+        target_link_options(esdb_externalobject PRIVATE /Brepro)
     else()
         target_compile_options(esdb_externalobject PRIVATE -Wall -Wextra -Wpedantic)
     endif()
@@ -123,8 +131,6 @@ if(ESDB_BUILD_EXTERNALOBJECT)
 endif()
 
 if(ESDB_BUILD_TESTS)
-    enable_testing()
-
     add_executable(esdb_runtime_smoke tests/runtime_smoke.cpp)
     target_link_libraries(esdb_runtime_smoke PRIVATE ESDB::esdb)
     add_test(NAME esdb_runtime_smoke COMMAND esdb_runtime_smoke)
@@ -137,12 +143,21 @@ if(ESDB_BUILD_TESTS)
     target_link_libraries(esdb_hardening PRIVATE ESDB::esdb)
     add_test(NAME esdb_hardening COMMAND esdb_hardening)
 
+    add_executable(esdb_crash_smoke tests/crash_smoke.cpp)
+    target_link_libraries(esdb_crash_smoke PRIVATE ESDB::esdb)
+    add_test(NAME esdb_crash_smoke COMMAND esdb_crash_smoke)
+
+    add_executable(esdb_multiprocess_smoke tests/multiprocess_smoke.cpp)
+    target_link_libraries(esdb_multiprocess_smoke PRIVATE ESDB::esdb)
+    add_test(NAME esdb_multiprocess_smoke COMMAND esdb_multiprocess_smoke)
+
     add_executable(esdb_c_header_smoke tests/c_header_smoke.c)
     target_link_libraries(esdb_c_header_smoke PRIVATE ESDB::esdb)
     set_property(TARGET esdb_c_header_smoke PROPERTY LINKER_LANGUAGE CXX)
     add_test(NAME esdb_c_header_smoke COMMAND esdb_c_header_smoke)
 endif()
 
+if(ESDB_INSTALL)
 install(TARGETS esdb
     EXPORT esdbTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -187,8 +202,8 @@ install(EXPORT esdbTargets
     NAMESPACE ESDB::
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/esdb
 )
-install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/esdb)
-install(FILES README.md CHANGELOG.md
+install(FILES LICENSE THIRD_PARTY_NOTICES.md DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/esdb)
+install(FILES README.md CHANGELOG.md THIRD_PARTY_NOTICES.md
     DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/esdb
 )
 install(DIRECTORY docs/
@@ -202,4 +217,7 @@ set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
 set(CPACK_PACKAGE_FILE_NAME
     "ESDB-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
 set(CPACK_GENERATOR "ZIP")
+set(CPACK_PROJECT_CONFIG_FILE
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CPackProjectConfig.cmake")
 include(CPack)
+endif()

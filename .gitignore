@@ -2,12 +2,15 @@
 /build-*/
 /install/
 /install-*/
+/consumer-*/
+/embed-*/
 /.idea/
 /.vs/
 *.obj
 *.o
 *.pdb
 /ESDB-*.zip
+/ESDB-*.zip.sha256
 /_CPack_Packages/
 *.ilk
 *.exp
@@ -16,10 +19,14 @@
 *.exe
 *.log
 *.tmp
+/esdb-*.sqlite
+/esdb-*.sqlite-wal
+/esdb-*.sqlite-shm
+/debug-*.sqlite
+/debug-*.sqlite-wal
+/debug-*.sqlite-shm
 .DS_Store
 
-# Fetched SQLite amalgamation (pinned by tools/fetch-sqlite.ps1)
-/third_party/sqlite/*.c
-/third_party/sqlite/*.h
+# SQLite is vendored and verified at configure time. Download/staging residue is ignored.
 /third_party/sqlite/*.zip
 /third_party/sqlite/.fetched

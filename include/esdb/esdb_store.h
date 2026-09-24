@@ -127,11 +127,13 @@ ESDB_API esdb_status esdb_store_revision(
 /*
  * Iterates change records with revision > after_revision, oldest first.
  * after_revision must be <= ESDB_REVISION_MAX.
- * `store_name_or_null` filters to one store when non-NULL. `limit` is clamped
- * to ESDB_CHANGE_LIMIT_MAX (0 means the clamp maximum).
+ * `store_name_or_null` filters to one store when non-NULL. `limit == 0` means
+ * ESDB_CHANGE_LIMIT_MAX; values greater than ESDB_CHANGE_LIMIT_MAX are rejected.
  *
- * *out_last_revision receives the highest revision examined, and
- * *out_change_count the number of changes delivered.
+ * *out_last_revision receives the highest revision delivered to the callback,
+ * and *out_change_count the number of callback deliveries. If the callback
+ * stops early, rows already copied into the internal snapshot but not delivered
+ * do not advance the returned cursor.
  */
 ESDB_API esdb_status esdb_store_changes_since(
     esdb_database *database,
@@ -160,9 +162,11 @@ ESDB_API esdb_status esdb_store_prune_changes(
 
 /*
  * Subscription: a cursor over the change log for polling consumers.
- * after_revision must be <= ESDB_REVISION_MAX. A subscription is connection-scoped and not thread-safe; poll it from the
- * same thread that owns the database handle (or under FULLMUTEX with external
- * serialization of the poll sequence).
+ * after_revision must be <= ESDB_REVISION_MAX. A subscription is connection-scoped.
+ * esdb_subscription_poll() permits only one active poll per subscription;
+ * concurrent or reentrant polling of the same subscription fails with
+ * ESDB_ERR_BUSY rather than blocking indefinitely. esdb_subscription_revision()
+ * may be read concurrently. Destruction must not race an active poll.
  *
  * esdb_subscription_poll() delivers changes with revision greater than the
  * subscription's current revision and advances it to the highest revision

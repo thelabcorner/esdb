@@ -42,7 +42,7 @@ Default open flags include ESDB_OPEN_FULLMUTEX.
 
 With FULLMUTEX, SQLite serializes individual connection calls. ESDB's own bookkeeping uses internal mutexes for transaction/savepoint and error state.
 
-FULLMUTEX does not serialize an application's multi-call unit of work. Sharing one connection across threads while one thread owns a logical transaction requires external application-level serialization.
+FULLMUTEX does not serialize an application's multi-call unit of work. Sharing one connection across threads while one thread owns a logical transaction requires external application-level serialization. ESDB Store adds its own connection-local serialization around complete Store mutations and invariant-sensitive Store reads, but that does not extend to arbitrary Runtime/native-handle SQL.
 
 With NOMUTEX, the caller must serialize all access.
 
@@ -78,11 +78,11 @@ esdb.hpp is move-only and status-returning.
 
 It does not throw ESDB failures. Callers may layer their own exception policy above returned statuses.
 
-A Database must outlive child Transaction and Savepoint objects.
+A Database must outlive child Transaction and Savepoint objects. Public savepoint names may not use the case-insensitive `__esdb_` prefix, which is reserved for ESDB's internal transactional scopes.
 
 ## ExternalObject adapter
 
-The adapter uses ESABI v0.3.0 as the sole host ABI definition.
+The adapter uses ESABI 0.3.1 as the sole host ABI definition.
 
 Host exports are:
 
@@ -106,7 +106,7 @@ The adapter is intentionally not an SQL transport.
 
 ### Handle safety
 
-JS-visible database handles are positive 32-bit generation-tagged tokens. Reusing a slot advances the generation; a stale token no longer resolves to the new database occupying that slot.
+JS-visible database handles are positive 32-bit generation-tagged tokens. Reusing a slot advances the generation; a stale token no longer resolves to the new database occupying that slot. Generations never wrap: after the finite generation space for one slot is exhausted, that slot is retired for the remainder of the process so an ancient token cannot become valid again through ABA reuse.
 
 The staged-path channel and adapter last-error state are thread-local. The handle table itself is process-global and mutex-protected.
 

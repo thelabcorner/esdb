@@ -12,8 +12,9 @@ extern "C" {
  * ESDB Runtime: connection lifecycle, transactions, schema versioning,
  * integrity, backup, and observability over a single native storage engine.
  *
- * The v0.1 engine is stock SQLite (pinned, fetched by tools/fetch-sqlite.ps1)
- * compiled into the ESDB library. The public header never exposes a sqlite3*
+ * The v0.1 engine is stock SQLite 3.53.4, vendored and cryptographically
+ * verified from the canonical cmake/sqlite-pin.json release pin, then compiled
+ * into the ESDB library. The public header never exposes a sqlite3*
  * type; the controlled escape hatch is esdb_native_handle(), documented in
  * docs/ABI.md.
  *
@@ -37,9 +38,10 @@ enum {
 };
 
 /*
- * Journal modes. ESDB_OPEN never selects OFF (a durable database is the
- * default product contract); the value exists so health reporting stays
- * faithful if a consumer changed the mode through the escape hatch.
+ * Journal modes. esdb_open() rejects MEMORY and OFF because the Runtime open
+ * contract is durable by default. Those values remain public so health
+ * reporting stays faithful if a native consumer deliberately changes the mode
+ * through the controlled SQLite handle.
  */
 typedef uint32_t esdb_journal_mode;
 enum {
@@ -229,7 +231,8 @@ ESDB_API int esdb_transaction_active(const esdb_transaction *transaction);
 /*
  * Savepoints are LIFO scoped within an active esdb_transaction. Names use a
  * conservative ASCII token grammar ([A-Za-z0-9_], 1..64 bytes) so they can be
- * quoted safely. release/rollback require the name to match the top of the
+ * quoted safely. The case-insensitive prefix `__esdb_` is reserved for ESDB's
+ * internal scopes. release/rollback require the name to match the top of the
  * savepoint stack; out-of-order operations fail with ESDB_ERR_INVALID_STATE.
  *
  * esdb_savepoint_rollback() rolls back to the savepoint and releases it
