@@ -1,0 +1,25 @@
+/build/
+/build-*/
+/install/
+/install-*/
+/.idea/
+/.vs/
+*.obj
+*.o
+*.pdb
+/ESDB-*.zip
+/_CPack_Packages/
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.log
+*.tmp
+.DS_Store
+
+# Fetched SQLite amalgamation (pinned by tools/fetch-sqlite.ps1)
+/third_party/sqlite/*.c
+/third_party/sqlite/*.h
+/third_party/sqlite/*.zip
+/third_party/sqlite/.fetched
