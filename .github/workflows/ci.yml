@@ -113,7 +113,8 @@ jobs:
         run: |
           cpack --config build/CPackConfig.cmake -C Release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $package = Get-ChildItem -LiteralPath . -Filter "ESDB-*.zip" | Select-Object -Single
+          $package = Get-ChildItem -LiteralPath . -Filter "ESDB-*.zip" | Select-Object -First 1
+          if (-not $package) { throw "CPack ZIP was not generated in the repository root" }
           $first = (Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash
           Start-Sleep -Seconds 2
           cpack --config build/CPackConfig.cmake -C Release
