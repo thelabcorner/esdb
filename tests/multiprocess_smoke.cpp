@@ -1,6 +1,7 @@
 #include <esdb/esdb.h>
 #include <esdb/esdb_store.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

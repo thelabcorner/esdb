@@ -50,7 +50,7 @@ jobs:
         run: ./embed-build/esdb_embed_consumer
 
   windows:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v5
 
@@ -69,7 +69,12 @@ jobs:
 
       - name: Verify ExternalObject exports
         shell: pwsh
-        run: ./tools/verify-externalobject-exports.ps1 -Dll ./build/Release/ESDB.dll
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $toolset = Get-ChildItem -LiteralPath "$vsPath\VC\Tools\MSVC" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $env:PATH = "$($toolset.FullName)\bin\Hostx64\x64;$env:PATH"
+          ./tools/verify-externalobject-exports.ps1 -Dll ./build/Release/ESDB.dll
 
       - name: Install
         run: cmake --install build --config Release --prefix "${{ github.workspace }}/install"
