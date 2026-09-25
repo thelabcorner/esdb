@@ -22,15 +22,48 @@ It is not a replacement for product-owned relational schema. Applications with j
 
 ## ObjectStore namespaces
 
-The public model is:
-
-~~~text
-store name + key -> value
-~~~
+```mermaid
+graph LR
+    SN["store name"] --> KV["key"]
+    KV --> V["value"]
+```
 
 ObjectStore names and keys are UTF-8 data, never interpolated SQL identifiers.
 
 All ObjectStore-owned SQL objects use the reserved `__esdb_` prefix.
+
+## Two store layers
+
+The two layers share the typed-value domain but not persistence or revision semantics.
+
+```mermaid
+graph TD
+    subgraph Durable["ObjectStore (esdb_object_store.h)"]
+        D1["named stores + keys"]
+        D2["SQLite-backed, durable"]
+        D3["persistent global revisions"]
+        D4["explicit pruning (no gap event)"]
+    end
+
+    subgraph Memory["Store (esdb_store.h)"]
+        M1["named stores + keys"]
+        M2["process memory, not a database"]
+        M3["per-store revisions"]
+        M4["bounded 4096-change journal\nretainedFloor() + ESDB_ERR_GAP"]
+    end
+
+    Domain["shared canonical value domain\nNULL BOOL INT32 INT64 DOUBLE\nUTF8 BYTES ARRAY OBJECT"]
+    Runtime["ESDB Runtime"]
+
+    Durable --> Domain
+    Memory --> Domain
+    D1 --> Runtime
+    D2 --> Runtime
+    Memory -.->|no disk I/O by default| Runtime
+
+    classDef mem fill:#eef,stroke-dasharray: 5 5
+    class Memory,M1,M2,M3,M4 mem
+```
 
 ## Process-memory Store
 

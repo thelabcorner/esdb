@@ -25,12 +25,12 @@ esdb_close() ends ownership of the database wrapper.
 
 Required ordering:
 
-~~~text
-destroy/release subscriptions
-destroy/release savepoints
-commit/rollback/destroy transaction
-close database
-~~~
+```mermaid
+graph TD
+    A["destroy/release subscriptions"] --> B["destroy/release savepoints"]
+    B --> C["commit/rollback/destroy transaction"]
+    C --> D["close database"]
+```
 
 No thread may race esdb_close().
 

@@ -262,8 +262,8 @@ are the 9-run process medians; spread is the process-median relative range.
 | Prepare total | 65.3 us | 60.8 us | 1.074x | 108.9% / 86.7% |
 | Prepare per statement | 10.883 us | 10.133 us | 1.074x | 108.9% / 86.7% |
 | SQLite statement memory | 11,800 B | 11,800 B | 1.000x | 0% / 0% |
-| Executable | 47,616 B | 45,568 B | 1.045x | — |
-| Object file | 319,078 B | 298,036 B | 1.071x | — |
+| Executable | 47,616 B | 45,568 B | 1.045x | - |
+| Object file | 319,078 B | 298,036 B | 1.071x | - |
 
 Statement count and reuse were identical (6 statements; reuse true). The scan
 stability check is **STABLE** on this 9-process run: the maximum process-median

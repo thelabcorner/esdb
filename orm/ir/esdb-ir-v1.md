@@ -68,9 +68,9 @@ Rules:
 
 Two names exist for every table, column, and query parameter:
 
-- `name` — the IR/logical identifier. Grammar: `[A-Za-z_][A-Za-z0-9_]*`,
+- `name` - the IR/logical identifier. Grammar: `[A-Za-z_][A-Za-z0-9_]*`,
   length 1..64.
-- `sql_name` — the physical SQL identifier. Grammar: same, length 1..64,
+- `sql_name` - the physical SQL identifier. Grammar: same, length 1..64,
   must not be an SQL keyword, and must not begin with `sqlite_` or `__esdb_`
   (case-insensitive). SQL identifiers are case-insensitive for collision
   detection. SQL names are always emitted double-quoted by the compiler; the
@@ -123,19 +123,19 @@ creation. Adding a type requires a new IR minor revision plus codegen updates.
 
 ### 4.2 Column fields
 
-- `nullable` — required boolean.
-- `primary_key` — required boolean. At most one table-level PK is supported in
+- `nullable` - required boolean.
+- `primary_key` - required boolean. At most one table-level PK is supported in
   v1; it must match `primary_key`.
-- `autoincrement` — required boolean. Only valid on a single-column integer
+- `autoincrement` - required boolean. Only valid on a single-column integer
   primary key (`IR013` otherwise).
-- `unique` — required boolean. Column-level uniqueness.
-- `default` — optional object, alternate to `defaults` map; see §4.4.
+- `unique` - required boolean. Column-level uniqueness.
+- `default` - optional object, alternate to `defaults` map; see §4.4.
 
 ### 4.3 Table keys
 
-- `primary_key` — array of logical column `name`s, in declaration order. Required and
+- `primary_key` - array of logical column `name`s, in declaration order. Required and
   non-empty; must agree exactly with the `primary_key` column flags (`IR014`).
-- `uniques` — array of arrays of column `name`s. Each unique key must agree
+- `uniques` - array of arrays of column `name`s. Each unique key must agree
   with the `unique` column flags (`IR015`); column-flagged uniques are
   emitted here as single-element keys. Order is significant and part of the
   hash.
@@ -166,17 +166,17 @@ matches the column. `DEFAULT NULL` is valid only for a nullable column; a
 
 Tables may additionally declare three deterministic structural collections:
 
-- `foreign_keys` — sorted by constraint `name`. Each entry declares local
+- `foreign_keys` - sorted by constraint `name`. Each entry declares local
   `columns`, a referenced logical `table` + `columns`, and explicit
   `on_update` / `on_delete` actions from `no action`, `restrict`,
   `cascade`, `set null`, or `set default`. Local/reference arity must
   match; the target columns must exactly match the referenced table's primary
   key or a declared unique key; corresponding IR types must match. `SET NULL`
   requires nullable child columns and `SET DEFAULT` requires child defaults.
-- `checks` — sorted named constraints with a compile-time `sql` expression.
+- `checks` - sorted named constraints with a compile-time `sql` expression.
   The expression is validated as a bounded static SQL fragment, is part of the
   semantic hash, and never contains caller values.
-- `indexes` — sorted explicit indexes with `unique`, one or more ordered
+- `indexes` - sorted explicit indexes with `unique`, one or more ordered
   terms, and optional static `where` predicate. Column terms carry
   `asc`/`desc`; expression terms carry a bounded static SQL expression.
   Partial-index predicates and term order/direction are semantic and therefore
@@ -194,10 +194,10 @@ parameterized; values are bound, never interpolated.
 
 ### 5.1 Common fields
 
-- `name` — required, unique (§3).
-- `kind` — one of `select`, `insert`, `upsert`, `update`, `delete`.
-- `table` — required, must reference a table `name`.
-- `cardinality` — `one` (select only), `many` (select), or `changes`
+- `name` - required, unique (§3).
+- `kind` - one of `select`, `insert`, `upsert`, `update`, `delete`.
+- `table` - required, must reference a table `name`.
+- `cardinality` - `one` (select only), `many` (select), or `changes`
   (insert/upsert/update/delete).
 
 ### 5.2 `select`
@@ -219,7 +219,7 @@ parameterized; values are bound, never interpolated.
   non-empty, and keyed for `cardinality: "one"`. Operators: `eq` only in v1.
 - `select` projection is always all columns in declaration order.
 - `order_by` is optional; columns must exist. v1 only allows `order_by` when
-  the select is not `cardinality: "one"`? No — ordering a keyed single-row
+  the select is not `cardinality: "one"`? No. Ordering a keyed single-row
   select is harmless and allowed, but must reference existing columns.
 - `cardinality: "one"` requires the `where` set to cover a primary key or a
   declared unique key (`IR021`) so "one" is a real guarantee.
@@ -348,24 +348,24 @@ type is the referenced column's IR type.
 
 `esdb-canonical-json-v1`:
 
-1. **Encoding** — UTF-8, no BOM.
-2. **Whitespace** — none between tokens. The sealed file is the canonical
+1. **Encoding**: UTF-8, no BOM.
+2. **Whitespace**: none between tokens. The sealed file is the canonical
    form of the sealed document with **no trailing newline**.
-3. **Object keys** — sorted ascending by Unicode code point (not UTF-16 code
+3. **Object keys**: sorted ascending by Unicode code point (not UTF-16 code
    unit; astral keys sort by scalar value).
-4. **Strings** — `"` and `\` escaped as `\"` / `\\`; U+0008/0009/000A/000C/000D
+4. **Strings**: `"` and `\` escaped as `\"` / `\\`; U+0008/0009/000A/000C/000D
    as `\b`/`\t`/`\n`/`\f`/`\r`; other C0 controls as `\u00xx` with lowercase
    hex. All other code points, including non-ASCII, are emitted raw UTF-8.
    Lone surrogates are rejected (`IR024`).
-5. **Numbers** — forbidden; see §1 (`IR022`).
-6. **Literals** — `true`, `false`, `null`.
-7. **Hash projection** — the document with the top-level keys `integrity`,
+5. **Numbers**: forbidden; see §1 (`IR022`).
+6. **Literals**: `true`, `false`, `null`.
+7. **Hash projection**: the document with the top-level keys `integrity`,
    `generator`, and `annotations` removed. The SHA-256 of the projection's
    canonical bytes is the IR hash. Note that `integrity.hash` is therefore
    **not** the SHA-256 of the sealed file: the file contains `integrity`
    itself. The projection hash is the contract; `sha256(file bytes)` is a
    different value by construction.
-8. **Embedded form** — `integrity = { algorithm: "sha256", canonical:
+8. **Embedded form**: `integrity = { algorithm: "sha256", canonical:
    "esdb-canonical-json-v1", hash: "<lowercase hex>" }`. `seal` computes it;
    `hash --check` re-computes it and fails on mismatch.
 

@@ -2,13 +2,13 @@
 
 # ESDB: Native application state and durable storage for Adobe tooling
 
-### SQLite-backed Runtime + optional Store API + ESABI ExternalObject adapter
+### SQLite-backed Runtime + two optional Store layers + ESABI ExternalObject adapter
 
 [![Version](https://img.shields.io/badge/version-0.2.0-orange)](#status)
 [![SQLite](https://img.shields.io/badge/SQLite-3.53.4-blue)](https://www.sqlite.org/)
 [![C ABI](https://img.shields.io/badge/API-C%20ABI%20%2B%20C%2B%2B11%2B-success)](#native-api)
 [![ExtendScript](https://img.shields.io/badge/Illustrator%2030.6-live%20validated-success)](#extendscript)
-[![Compression](https://img.shields.io/badge/compression-qualification%20pending-lightgrey)](docs/COMPRESSION.md)
+[![Compression](https://img.shields.io/badge/compression-ZIPVFS%20opt--in-lightgrey)](docs/COMPRESSION.md)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 </div>
@@ -89,12 +89,14 @@ Adobe-native tools repeatedly need the same infrastructure: durable state, trans
 
 ESDB centralizes that infrastructure without turning every consumer into a key/value database.
 
-The project has two deliberately separate layers:
+The project has deliberately separate layers:
 
 - **ESDB Runtime** owns SQLite lifecycle, durability policy, transactions, migrations, health, backup, and the storage-backend contract.
-- **ESDB Store** is optional. It adds named object stores, canonical values, monotonic revisions, and pull-based change polling.
+- **ESDB ObjectStore** is an optional durable layer. It adds named on-disk stores, canonical values, monotonic revisions, and pull-based change polling, all layered above Runtime.
+- **ESDB Store** is an optional process-memory state plane. It is deliberately not a SQLite database: named, typed, synchronous, and revisioned state that lives for the process lifetime and performs no disk I/O by default.
+- **ESDB ORM compiler** is an optional build-time toolchain over Runtime. It is not a runtime engine and not a Store dependency.
 
-A native product such as Workmark can use Runtime with its own relational schema. ExtendScript utilities can use Store as a higher-level state/object API. Both share the same native engine.
+A native product such as Workmark can use Runtime with its own relational schema. ExtendScript utilities can use ObjectStore for durable state and Store for fast in-process state. All share the same native engine.
 
 ESDB is **not** "SQLite exposed to ExtendScript." SQLite is the durable kernel; ESDB defines the lifecycle, portability, typed values, revision model, and Adobe-facing boundary around it.
 
@@ -102,49 +104,59 @@ ESDB is **not** "SQLite exposed to ExtendScript." SQLite is the durable kernel; 
 
 0.2.0 builds on the 0.1.0 foundation. It currently includes:
 
-- pinned SQLite 3.53.4;
-- stable opaque-handle C ABI;
-- move-only C++11+ RAII facade;
-- explicit open/journal/synchronous/cache policies;
+- pinned, vendored SQLite 3.53.4 with configure-time SHA-256 pin verification;
+- stable opaque-handle C ABI and a move-only C++11+ RAII facade;
+- explicit open, journal, synchronous, cache, busy-timeout, WAL-checkpoint, and foreign-key policies with readback verification;
 - transactions and LIFO savepoints;
 - product-owned schema migrations using PRAGMA user_version;
-- integrity and online backup APIs;
+- integrity checks, online backup, and a controlled native-handle escape hatch;
 - backend capability and database health snapshots;
-- optional typed Store with durable revisions/change polling;
-- ESABI 0.3.1 ExternalObject adapter with transaction + typed Store transport;
-- ES3-safe Store facade with store/get/set/patch/transaction/subscribe, exact INT64/BYTES wrappers, byte-exact UTF-8 transport, and explicit unload lifecycle;
-- native and adapter smoke/hardening tests;
+- optional durable ObjectStore with canonical values, durable monotonic revisions, and change polling;
+- optional process-memory Store with bounded journals, scan limits, and retained-floor/gap status;
+- optional ORM compiler lane: `drizzle-orm@0.45.3` extraction into sealed `esdb.ir/v1`, deterministic C++11/TypeScript/ES3/ESABI generation, and `drizzle-kit@0.31.11` migration packaging;
+- ESABI 0.3.1 ExternalObject adapter with transaction, typed ObjectStore, and bounded typed raw-SQL transport;
+- ES3-safe facade with get/set/patch, transactions, subscriptions, exact INT64/BYTES wrappers, byte-exact UTF-8 transport, and a guarded unload lifecycle;
+- native, adapter, store, and ORM drift/smoke/hardening tests;
 - live Illustrator 30.6.0 / ExtendScript 4.5.6 facade validation.
 
-Transparent page compression is intentionally **not enabled yet**. See [docs/COMPRESSION.md](docs/COMPRESSION.md).
+Transparent page compression is **implemented as an opt-in ZIPVFS provider**, but it is not enabled in the public build. See [Compression](#compression).
 
 ## Architecture
 
-~~~text
-                         ESDB
-                          |
-              +-----------+-----------+
-              |                       |
-         ESDB Runtime             ESDB Store
-              |                       |
-     SQLite ownership          named object stores
-     transactions              canonical values
-     migrations                durable revisions
-     backup/integrity          change polling
-     health/backend caps              |
-              +-----------+-----------+
-                          |
-                    ESDB Core C++
-                          |
-                  stable esdb_* C ABI
-                    /             \
-                   /               \
-          native C/C++          ESABI adapter
-             callers                |
-                              ExternalObject
-                                    |
-                              extendscript/esdb.jsx
-~~~
+```mermaid
+graph TD
+    Consumer["Consumer\n(native product / ExtendScript utility)"]
+
+    subgraph Core["ESDB Core (C++)"]
+        ABI["stable esdb_* C ABI"]
+        Runtime["ESDB Runtime\nSQLite ownership, transactions,\nmigrations, backup, integrity, health"]
+        ObjectStore["ESDB ObjectStore\n(optional, durable)\nnamed stores, canonical values,\ndurable revisions, change log"]
+        MemoryStore["ESDB Store\n(optional, process-memory)\ntyped state, bounded journal,\nno disk I/O by default"]
+        Zipvfs["Storage provider contract\nplain SQLite (default)\nlicensed ZIPVFS (opt-in)"]
+    end
+
+    subgraph Adapter["Adobe boundary"]
+        ESABI["ESABI 0.3.1 adapter\nexternalobject"]
+        JSX["extendscript/esdb.jsx\nES3 facade"]
+    end
+
+    Compiler["ESDB ORM compiler\n(build-time, optional)\ndrizzle-orm -> sealed esdb.ir/v1\n-> C++11 / TS / ES3 / ESABI"]
+
+    Runtime --> ABI
+    ObjectStore --> Runtime
+    MemoryStore -.->|opt-in bridge| Runtime
+    Runtime --> Zipvfs
+
+    ABI --> Consumer
+    ABI --> ESABI
+    ESABI --> JSX
+    JSX --> Consumer
+
+    Compiler -.->|generates repositories\nover the C ABI| ABI
+
+    classDef optional stroke-dasharray: 5 5
+    class ObjectStore,MemoryStore,Compiler optional
+```
 
 Runtime has no hidden writer thread. Store may grow explicit buffered/cache policies later, but Runtime will remain neutral about scheduling.
 
@@ -233,9 +245,13 @@ builds/runs the native repository smoke, and builds/runs the concrete ESABI
 bridge smoke. See [docs/ORM_ARCHITECTURE.md](docs/ORM_ARCHITECTURE.md) and
 [tools/esdb-schema/README.md](tools/esdb-schema/README.md).
 
-## Store
+## Store layers
 
-Store is optional and lives in esdb_store.h.
+ESDB ships two independent optional layers, and they are not interchangeable.
+
+### ObjectStore: durable, SQLite-backed
+
+`esdb_object_store.h` is the IndexedDB-shaped durable layer above Runtime. The canonical value domain is NULL, BOOL, INT32, INT64, DOUBLE, UTF8, BYTES, ARRAY, OBJECT.
 
 ~~~c
 #include <esdb/esdb.h>
@@ -249,11 +265,15 @@ esdb_object_store_put(db, "settings", "theme", value, &revision, NULL);
 esdb_value_destroy(value);
 ~~~
 
-The canonical value domain is NULL, BOOL, INT32, INT64, DOUBLE, UTF8, BYTES, ARRAY, OBJECT.
+Revisions are monotonic durable metadata. Deleting or pruning change rows does not reset the current revision, and reopening the database preserves it. Store names and keys are data, never SQL identifiers. The `__esdb_` schema prefix is reserved.
 
-INT64 and BYTES remain native lossless types. They are not silently coerced into unsafe ExtendScript numbers/strings.
+### Store: process-memory
 
-Store revisions are monotonic durable metadata. Deleting/pruning change rows does not reset the current revision, and reopening the database preserves it.
+`esdb_store.h` is a different thing entirely. A Store is deliberately not a SQLite database. It is named, typed, synchronous, and revisioned state shared by every client that resolves the same ESDB core module in one process, and it performs no disk I/O by default. State disappears when the host process exits or the named store is destroyed.
+
+Native plug-ins and the ExternalObject adapter share the same Store only when both link or load the same shared ESDB core library. Static copies intentionally have independent registries. Persistence is opt-in through a Runtime / ObjectStore bridge.
+
+INT64 and BYTES remain native lossless types on both layers. They are never silently coerced into unsafe ExtendScript numbers or strings.
 
 See [docs/STORE.md](docs/STORE.md).
 
@@ -267,7 +287,7 @@ The JSX facade exposes Store ergonomics while keeping the native adapter typed a
 ESDB.load("lib:ESDB");
 
 var db = ESDB.open(new File("~/my-plugin-state.esdb"));
-var settings = db.objectStore("settings").ensure();
+var settings = db.objectStore("settings").ensure();   // durable ObjectStore
 
 settings.set("theme", "dark");
 settings.patch({
@@ -335,7 +355,17 @@ Illustrator 30.6.0 / ExtendScript 4.5.6 additionally passes the live ESTC parser
 
 Plain SQLite is the reference backend and remains directly inspectable with stock SQLite tools.
 
-Compression will not be selected by familiarity or ratio alone. A candidate backend must pass the same semantics plus crash recovery, multi-process locking, backup, migration, and tooling gates before performance or size is considered.
+ESDB defines a storage-provider contract (`ESDB_STORAGE_PLAIN`, `ESDB_STORAGE_COMPRESSED`, `ESDB_PROVIDER_SQLITE`, `ESDB_PROVIDER_ZIPVFS`) and implements a ZIPVFS-backed provider in `src/esdb_zipvfs.cpp` with Zstd and deflate codecs. ZIPVFS is proprietary SQLite source, so it is never vendored into public ESDB. A licensee points the build at their private `zipvfs.c` and `zipvfs.h`:
+
+~~~powershell
+cmake --preset vs2022-x64-release `
+  -DESDB_ZIPVFS_SOURCE=C:/path/to/zipvfs.c `
+  -DESDB_ZIPVFS_INCLUDE_DIR=C:/path/to/zipvfs/include `
+  -DESDB_ZSTD_INCLUDE_DIR=C:/path/to/zstd/include `
+  -DESDB_ZSTD_LIBRARY=C:/path/to/zstd.lib
+~~~
+
+The public build advertises plain SQLite only. A compressed request without a configured provider is rejected rather than silently falling back. Compression is not selected by familiarity or ratio alone: a candidate backend must pass the same semantics plus crash recovery, multi-process locking, backup, migration, and tooling gates before performance or size is considered.
 
 See [docs/COMPRESSION.md](docs/COMPRESSION.md).
 
@@ -343,22 +373,27 @@ See [docs/COMPRESSION.md](docs/COMPRESSION.md).
 
 ~~~text
 esdb/
-├─ include/esdb/          public C/C++ API
-├─ src/                   Runtime, Store, canonical values
-├─ adapters/externalobject/
+├─ include/esdb/          public C/C++ API (esdb.h, esdb.hpp,
+│                         esdb_object_store.h, esdb_store.h, esdb_value.h)
+├─ src/                   Runtime, ObjectStore, memory Store, values, ZIPVFS
+├─ adapters/externalobject/   ESABI adapter
 ├─ extendscript/          ES3 facade
-├─ tests/
-├─ tools/                 pinned SQLite acquisition
-├─ cmake/
+├─ orm/                   ORM compiler contract and drizzle frontend
+├─ examples/orm/user/     executable reference slice
+├─ bench/                 ORM benchmark harness
+├─ tests/                 native smoke/hardening + ORM test suite
+├─ tools/                 esdb-schema CLI, SQLite pin/acquisition, live probes
+├─ cmake/                 SQLite pin, ZIPVFS combine, CPack policy
 └─ docs/
 ~~~
 
 ## Known limitations
 
-- The only shipped storage backend is plain SQLite.
-- Transparent compression is not implemented yet.
+- The only storage backend present in the public build is plain SQLite. ZIPVFS support requires a separately licensed source drop.
+- No compressed backend has passed the correctness and performance gates in [docs/COMPRESSION.md](docs/COMPRESSION.md), so none is selectable by default.
 - The JSX facade exposes durable ObjectStore and process-memory Store APIs plus synchronous pull-based change polling; asynchronous callbacks are not supported.
-- Durable ObjectStore pruning is explicit and does not synthesize a gap event in v0.1; the process-memory Store instead bounds its journal and exposes retained-floor/gap status.
+- Durable ObjectStore pruning is explicit and does not synthesize a gap event; the process-memory Store instead bounds its journal and exposes retained-floor/gap status.
+- The process-memory Store is not durable and is not shared across processes; only clients that resolve the same shared ESDB core in one process share its registry.
 - A database must outlive its transaction/savepoint/subscription handles.
 - FULLMUTEX protects individual SQLite connection calls, and ESDB serializes Store mutations plus invariant-sensitive Store reads, but multi-call application transaction sequences still require application-level serialization.
 - Live Illustrator runtime behavior is currently qualified on Illustrator 30.6.0 / ExtendScript 4.5.6 only; other host versions still require their own compatibility evidence.

@@ -23,19 +23,17 @@ A consumer can use Runtime and never create an ESDB Store table.
 
 Runtime exists specifically so applications can keep relational models relational. Workmark should keep its version graph, intervals, metadata, and indexes in its own tables inside workmark-helper.
 
-~~~text
-Workmark.aip
-    |
- VectorIPC
-    |
-workmark-helper
-    |
- Workmark StorageWriter
-    |
- ESDB Runtime
-    |
- SQLite
-~~~
+```mermaid
+graph TD
+    AIP["Workmark.aip"]
+    IPC["VectorIPC"]
+    Helper["workmark-helper"]
+    Writer["Workmark StorageWriter"]
+    Runtime["ESDB Runtime"]
+    SQLite["SQLite"]
+
+    AIP --> IPC --> Helper --> Writer --> Runtime --> SQLite
+```
 
 ESDB must not move SQLite into Illustrator's in-process .aip, replace VectorIPC, or turn Workmark records into generic Store blobs.
 
