@@ -276,6 +276,20 @@ nine-process minimum. `llvm-size` measured executable `.text` at 31,506 / 30,162
 B and object `.text` at 44,636 / 42,031 B (generated / handwritten); the
 produced executable file-size ratio is 1.045x.
 
+The same fair-decoding harness also passed on hosted Ubuntu CI
+(run 36200107422, 9 processes, balanced order, checksums matched exactly at
+`3188731244`): point read 1.802 / 1.783 us (1.011x), point write
+0.234 / 0.232 us (1.010x), 10k-row scan 1.413 / 1.416 ms (0.998x, process
+spread 2.9% / 4.5%, stable), bulk insert 1,675,505 / 1,712,336 rows/s
+(0.978x), prepare per statement 7.146 / 6.872 us (1.040x), prepare-each
+1.481 / 1.480 us (1.001x), statement memory 11,800 / 11,800 B, executable
+63,856 / 58,456 B (1.092x), object 80,864 / 62,152 B (1.301x). All
+provisional budgets passed there as well. The Linux object-file ratio is
+larger than the Windows one because the two platforms count different
+object/metadata content; the executed `.text` comparison above is the
+nearer code-size signal, and neither platform showed a latency overhead
+requiring generator changes.
+
 ## Typed raw-SQL application-query surface
 
 `esdb_query()` and ExternalObject `querySql()` are implemented as an explicit

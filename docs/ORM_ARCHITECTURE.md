@@ -954,6 +954,9 @@ runs and no more than 20% process-median spread. This run meets that ceiling and
 the provisional scan budget; the shorter 5-run cross-check is not an accepted
 scan gate. Point-read/write latency and executable `.text` remain near the
 hand-written baseline; no generator optimization was justified by these results.
+Hosted Ubuntu CI on the same harness (9 processes, checksums matched) measured
+point read **1.011x**, point write **1.010x**, scan **0.998x** (stable),
+bulk **0.978x**, with all provisional budgets passing.
 
 ESDB's documented concurrency evidence (256 concurrent Store puts across 8 threads, two-process WAL
 writers, abrupt-process recovery) is platform context, not ORM evidence. ORM-specific concurrency tests
