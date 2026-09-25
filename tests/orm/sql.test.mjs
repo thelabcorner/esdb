@@ -92,7 +92,7 @@ export async function run() {
     /* Generated DDL */
     const pkg = sql.buildMigrationPackage(goldenIr, {
         compilerName: "esdb-schema",
-        compilerVersion: "0.1.0",
+        compilerVersion: "0.2.0",
         irHash: goldenHash
     });
     const initFile = pkg.files.find((file) => file.relPath.endsWith(".sql"));

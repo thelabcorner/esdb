@@ -81,7 +81,7 @@ $probe = @"
     ESDB.load("lib:$libraryName");
     var esdbVersion = ESDB.version();
     var sqliteVersion = ESDB.sqliteVersion();
-    requireValue(esdbVersion == "0.1.0", "unexpected ESDB version");
+    requireValue(esdbVersion == "0.2.0", "unexpected ESDB version");
     requireValue(sqliteVersion == "3.53.4", "unexpected SQLite version");
     requireValue(ESDB.abiVersion() == 2, "unexpected ESDB ABI version");
     requireValue(ESDB.handleCount() == 0, "initial handle count is not zero");
