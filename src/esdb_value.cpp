@@ -159,7 +159,9 @@ esdb_status esdb_value_create_bytes(const void *bytes, uint64_t size, esdb_value
 }
 
 void esdb_value_destroy(esdb_value *value) { delete value; }
-esdb_value_type esdb_value_type_of(const esdb_value *value) { return value ? value->type : ESDB_VALUE_NULL; }
+esdb_value_type esdb_value_type_of(const esdb_value *value) {
+    return value ? value->type : static_cast<esdb_value_type>(ESDB_VALUE_NULL);
+}
 
 esdb_status esdb_value_get_bool(const esdb_value *value, int *out_value) {
     if (!value || !out_value) return ESDB_ERR_INVALID_ARGUMENT;

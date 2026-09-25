@@ -54,6 +54,9 @@ export async function run() {
     const clang = findTool("clang");
 
     const includes = ["-I", join(ESDB_ROOT, "include"), "-I", join(ESDB_ROOT, "third_party", "sqlite")];
+    const esabiProfile = process.platform === "win32"
+        ? []
+        : ["-DESABI_ABI_PROFILE=ESABI_ABI_PROFILE_LONG64"];
 
     compile(
         clangxx,
@@ -75,6 +78,7 @@ export async function run() {
             "-Wall",
             "-Wextra",
             ...includes,
+            ...esabiProfile,
             "-I",
             join(ESDB_ROOT, "..", "esabi", "include"),
             join(EXAMPLE_DIR, "bridge", "user_orm_bridge.cpp")
@@ -115,6 +119,7 @@ export async function run() {
             "-std=c11",
             "-Wall",
             "-Wextra",
+            ...esabiProfile,
             "-I",
             join(ESDB_ROOT, "..", "esabi", "include"),
             "-I",

@@ -106,7 +106,7 @@ function mismatchIsDescriptiveOnly() {
     const workDir = freshWorkDir("adoption-mismatch");
     const dbPath = join(workDir, "workmark-mismatch.sqlite");
     const sqlPath = join(FIXTURES_DIR, "workmark-initial.sql");
-    const sql = readFileSync(sqlPath, "utf8").replace(
+    const sql = readFileSync(sqlPath, "utf8").replace(/\r\n/g, "\n").replace(
         "CREATE INDEX idx_applied_operations_applied_at\n  ON applied_operations(applied_at);",
         ""
     );

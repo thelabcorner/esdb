@@ -54,6 +54,12 @@ if(EXISTS "${_ESDB_USER_ESABI_DIR}/CMakeLists.txt")
         PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../../third_party/sqlite"
     )
     target_compile_features(user_orm_bridge PRIVATE cxx_std_11)
+    if(NOT WIN32)
+        target_compile_definitions(
+            user_orm_bridge
+            PRIVATE ESABI_ABI_PROFILE=ESABI_ABI_PROFILE_LONG64
+        )
+    endif()
     set_target_properties(user_orm_bridge PROPERTIES OUTPUT_NAME "UserOrmBridge")
 
     if(MSVC)
@@ -86,6 +92,12 @@ if(EXISTS "${_ESDB_USER_ESABI_DIR}/CMakeLists.txt")
         PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../../third_party/sqlite"
     )
     target_compile_features(esdb_orm_user_bridge_smoke PRIVATE cxx_std_11)
+    if(NOT WIN32)
+        target_compile_definitions(
+            esdb_orm_user_bridge_smoke
+            PRIVATE ESABI_ABI_PROFILE=ESABI_ABI_PROFILE_LONG64
+        )
+    endif()
 
     add_executable(esdb_orm_user_bridge_bench bridge_bench.cpp)
     target_link_libraries(
@@ -97,6 +109,12 @@ if(EXISTS "${_ESDB_USER_ESABI_DIR}/CMakeLists.txt")
         PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../../third_party/sqlite"
     )
     target_compile_features(esdb_orm_user_bridge_bench PRIVATE cxx_std_11)
+    if(NOT WIN32)
+        target_compile_definitions(
+            esdb_orm_user_bridge_bench
+            PRIVATE ESABI_ABI_PROFILE=ESABI_ABI_PROFILE_LONG64
+        )
+    endif()
 
     if(MSVC)
         target_compile_options(esdb_orm_user_bridge_smoke PRIVATE /W4)

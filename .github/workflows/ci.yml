@@ -111,8 +111,8 @@ jobs:
         run: |
           clang++ -fsyntax-only -std=c++11 -Wall -Wextra -Werror -I include -I third_party/sqlite examples/orm/user/generated/cpp/user_repository.hpp
           clang++ -fsyntax-only -std=c++11 -Wall -Wextra -Werror -I include -I third_party/sqlite examples/orm/user/generated/migrations/user_migrations.hpp
-          clang++ -fsyntax-only -std=c++11 -Wall -Wextra -Werror -I include -I third_party/sqlite -I ../esabi/include examples/orm/user/bridge/user_orm_bridge.cpp
-          clang -fsyntax-only -std=c11 -Wall -Wextra -Werror -I ../esabi/include -I examples/orm/user/generated/bridge examples/orm/user/generated/bridge/user_orm_bridge_stub.c
+          clang++ -fsyntax-only -std=c++11 -Wall -Wextra -Werror -DESABI_ABI_PROFILE=ESABI_ABI_PROFILE_LONG64 -I include -I third_party/sqlite -I ../esabi/include examples/orm/user/bridge/user_orm_bridge.cpp
+          clang -fsyntax-only -std=c11 -Wall -Wextra -Werror -DESABI_ABI_PROFILE=ESABI_ABI_PROFILE_LONG64 -I ../esabi/include -I examples/orm/user/generated/bridge examples/orm/user/generated/bridge/user_orm_bridge_stub.c
 
       - name: Build native ORM and concrete ESABI bridge smokes
         run: |
@@ -136,7 +136,7 @@ jobs:
           node bench/run-orm-bench.mjs --build-dir build-orm-bench --repeats 9 --json-only
 
   orm-windows:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v5
 
@@ -194,7 +194,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   windows:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v5
 

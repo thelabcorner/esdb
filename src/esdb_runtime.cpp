@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -1846,7 +1847,7 @@ esdb_status esdb_database_health_get(esdb_database *database, esdb_database_heal
     out_health->compression_codec =
         database->options.storage_mode == ESDB_STORAGE_COMPRESSED
             ? database->options.compression_codec
-            : ESDB_CODEC_NONE;
+            : static_cast<esdb_codec>(ESDB_CODEC_NONE);
     out_health->compression_level =
         database->options.storage_mode == ESDB_STORAGE_COMPRESSED
             ? database->options.compression_level
