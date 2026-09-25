@@ -272,7 +272,11 @@ jobs:
         run: |
           cpack --config build/CPackConfig.cmake -C Release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $package = Get-ChildItem -LiteralPath . -Filter "ESDB-*.zip" | Select-Object -Single
+          $packages = @(Get-ChildItem -LiteralPath . -Filter "ESDB-*.zip")
+          if ($packages.Count -ne 1) {
+            throw "Expected exactly one ESDB ZIP, found $($packages.Count)."
+          }
+          $package = $packages[0]
           $first = (Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash
           Start-Sleep -Seconds 2
           cpack --config build/CPackConfig.cmake -C Release
