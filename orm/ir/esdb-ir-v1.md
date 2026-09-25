@@ -34,7 +34,7 @@ are never interpolated.
   },
   "generator": {                        // optional, non-semantic
     "name": "esdb-schema",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "source": "orm/drizzle/schema/user.schema.ts"
   },
   "annotations": {                      // optional, non-semantic, free-form

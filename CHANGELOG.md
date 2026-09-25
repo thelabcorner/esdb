@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 - 2026-09-23
+## 0.2.0 - 2026-09-25
 
 Initial ESDB foundation.
 

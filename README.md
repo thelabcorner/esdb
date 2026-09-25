@@ -4,7 +4,7 @@
 
 ### SQLite-backed Runtime + optional Store API + ESABI ExternalObject adapter
 
-[![Version](https://img.shields.io/badge/version-0.1.0-orange)](#status)
+[![Version](https://img.shields.io/badge/version-0.2.0-orange)](#status)
 [![SQLite](https://img.shields.io/badge/SQLite-3.53.4-blue)](https://www.sqlite.org/)
 [![C ABI](https://img.shields.io/badge/API-C%20ABI%20%2B%20C%2B%2B11%2B-success)](#native-api)
 [![ExtendScript](https://img.shields.io/badge/Illustrator%2030.6-live%20validated-success)](#extendscript)
@@ -100,7 +100,7 @@ ESDB is **not** "SQLite exposed to ExtendScript." SQLite is the durable kernel; 
 
 ## Status
 
-0.1.0 is a foundation build. It currently includes:
+0.2.0 builds on the 0.1.0 foundation. It currently includes:
 
 - pinned SQLite 3.53.4;
 - stable opaque-handle C ABI;
