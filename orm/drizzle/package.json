@@ -1,6 +1,6 @@
 {
   "name": "@esdb/orm-drizzle",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Drizzle frontend for the ESDB ORM IR v1 compiler: extracts public Drizzle table metadata (getTableConfig/getTableColumns) into language-neutral IR v1.",
   "type": "module",

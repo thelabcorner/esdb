@@ -1,6 +1,6 @@
 {
   "name": "esdb-schema",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Deterministic ESDB ORM IR v1 compiler: validate, canonicalize, hash, package migrations, and generate C++/ES3/TS bindings.",
   "type": "module",

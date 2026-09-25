@@ -13,7 +13,7 @@ import { DeriveError, deriveCrudQueries, mergeDeclaredQueries } from "./derive.t
 import { IR_VERSION, type IrDocument, type IrQuery } from "./ir-types.ts";
 
 export const FRONTEND_NAME = "esdb-orm-drizzle";
-export const FRONTEND_VERSION = "0.1.0";
+export const FRONTEND_VERSION = "0.2.0";
 
 export function drizzleOrmPin(): string {
     const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {

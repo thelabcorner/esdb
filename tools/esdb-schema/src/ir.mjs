@@ -12,7 +12,7 @@ import { bridgeFunctionName, queryMethodName, toCamel, toPascal, toSnake } from 
 export const IR_VERSION = "esdb.ir/v1";
 export const CANONICAL_ID = "esdb-canonical-json-v1";
 export const COMPILER_NAME = "esdb-schema";
-export const COMPILER_VERSION = "0.1.0";
+export const COMPILER_VERSION = "0.2.0";
 
 export const SCALAR_TYPES = ["integer", "text", "real", "blob"];
 

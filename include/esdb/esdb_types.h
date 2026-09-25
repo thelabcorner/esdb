@@ -19,9 +19,9 @@ extern "C" {
 #endif
 
 #define ESDB_VERSION_MAJOR 0u
-#define ESDB_VERSION_MINOR 1u
+#define ESDB_VERSION_MINOR 2u
 #define ESDB_VERSION_PATCH 0u
-#define ESDB_VERSION_STRING "0.1.0"
+#define ESDB_VERSION_STRING "0.2.0"
 
 /*
  * ESDB_ABI_VERSION tracks the binary contract, not the product version. It is
