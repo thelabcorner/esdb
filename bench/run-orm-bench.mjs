@@ -126,6 +126,8 @@ const generated = summarize(scheduled.rows.generated);
 
 const hm = handwritten.metrics;
 const gm = generated.metrics;
+const decodedRowsMatch =
+    gm.decoded_row_checksum.median === hm.decoded_row_checksum.median;
 const ratios = {
     startup_latency: gm.startup_ns.median / hm.startup_ns.median,
     prepare_latency: gm.prepare_ns.median / hm.prepare_ns.median,
@@ -182,7 +184,8 @@ const budgetStatus = {
     point_read: ratios.point_read_latency <= budgets.point_read_latency_max,
     point_write: ratios.point_write_latency <= budgets.point_write_latency_max,
     scan_10k: stabilityStatus.scan_10k && ratios.scan_10k_latency <= budgets.scan_10k_latency_max,
-    statement_reuse: generated.statement_reuse && handwritten.statement_reuse
+    statement_reuse: generated.statement_reuse && handwritten.statement_reuse,
+    decoded_rows_match: decodedRowsMatch
 };
 
 const report = {
@@ -198,6 +201,7 @@ const report = {
         scan_10k_process_median_relative_spread: scanProcessMedianSpread
     },
     stability_status: stabilityStatus,
+    decoded_rows_match: decodedRowsMatch,
     budget_status: budgetStatus,
     all_provisional_budgets_pass: Object.values(budgetStatus).every(Boolean)
 };
@@ -221,6 +225,7 @@ if (!options.jsonOnly) {
     console.log(`  bulk insert:    ${detail(gm.bulk_insert_rows_per_second, hm.bulk_insert_rows_per_second, rowsPerSecond)} = ${ratio(ratios.bulk_insert_throughput)}`);
     console.log(`  prepare/stmt:   ${detail(gm.prepare_per_statement_ns, hm.prepare_per_statement_ns, ns)} = ${ratio(ratios.prepare_per_statement_latency)}`);
     console.log(`  prepare-each:   ${detail(gm.prepare_each_point_read_ns, hm.prepare_each_point_read_ns, ns)} = ${ratio(ratios.prepare_each_point_read_latency)}`);
+    console.log(`  decoded rows:   ${decodedRowsMatch ? "MATCH" : "MISMATCH"} (checksum generated ${gm.decoded_row_checksum.median}, handwritten ${hm.decoded_row_checksum.median})`);
     console.log(`  persistent reuse speedup: generated ${ratio(ratios.generated_persistent_vs_prepare_each)} / handwritten ${ratio(ratios.handwritten_persistent_vs_prepare_each)}`);
     console.log(`  statement memory: generated ${gm.statement_memory_bytes.median} B / handwritten ${hm.statement_memory_bytes.median} B`);
     console.log(`  peak outstanding SQLite allocs (read/write/scan/bulk): generated ${gm.read_peak_allocation_count.median}/${gm.write_peak_allocation_count.median}/${gm.scan_peak_allocation_count.median}/${gm.bulk_peak_allocation_count.median} / handwritten ${hm.read_peak_allocation_count.median}/${hm.write_peak_allocation_count.median}/${hm.scan_peak_allocation_count.median}/${hm.bulk_peak_allocation_count.median}`);

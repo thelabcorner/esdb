@@ -934,25 +934,26 @@ Methodology:
 
 | Metric | Target | Current User-slice evidence (2026-09-25, Windows/MSVC Release; 9 process runs) |
 |---|---|---|
-| Point read median | <= 1.15x hand-written | **0.975x** (2.145 us generated / 2.201 us hand-written) |
-| Point write median | <= 1.15x hand-written | **1.018x** (0.396 us / 0.389 us) |
-| 10k-row scan median | <= 1.10x hand-written, only when stable | **0.983x** (2.098 ms / 2.134 ms); **unstable** (5.5% / 56.0% process spread) |
-| Bulk insert throughput | measured | **0.979x** (879,538 / 898,804 rows/s) |
-| Cold prepare per statement | measured and reported; no hard gate initially | **1.110x** (10.917 us / 9.833 us) |
-| Persistent reuse | asserted and quantified | prepare-each control 2.270 / 2.282 us/read; persistent speedups **1.058x / 1.037x** |
+| Point read median | <= 1.15x hand-written | **0.992x** (2.171 us generated / 2.188 us hand-written) |
+| Point write median | <= 1.15x hand-written | **0.998x** (0.395 us / 0.395 us) |
+| 10k-row scan median | <= 1.10x hand-written, only when stable | **0.973x** (2.384 ms / 2.450 ms); stable process spread (11.7% / 11.1%) |
+| Bulk insert throughput | measured | **0.975x** (890,028 / 912,392 rows/s) |
+| Cold prepare per statement | measured and reported; no hard gate initially | **1.074x** (10.883 us / 10.133 us) |
+| Persistent reuse | asserted and quantified | prepare-each control 2.304 / 2.361 us/read; persistent speedups **1.061x / 1.079x** |
 | SQLite statement memory | near hand-written | 11,800 B generated / 11,800 B hand-written |
-| Executable size | measured; budget set from evidence | 46,080 B / 43,008 B (**1.071x**) |
-| Object size | measured; budget set from evidence | 309,014 B / 278,079 B (**1.111x**) |
+| Executable size | measured; budget set from evidence | 47,616 B / 45,568 B (**1.045x**) |
+| Object size | measured; budget set from evidence | 319,078 B / 298,036 B (**1.071x**) |
 | Native ESABI crossing | historical live measurement | 1.924 us native find / 2.855 us bridge find; **+0.931 us**, **1.484x** |
 | Live Illustrator ES3 end-to-end | historical live measurement | Illustrator 30.6.0 / ExtendScript 4.5.6: **253.631 us/op corrected median**, 1,000 finds, 0 rejected samples |
 
-The current native harness uses balanced generated/handwritten process order and
-15 internal scan samples; all report medians/min/max/spread. The scan stability
-rule requires at least 9 process runs and no more than 20% process-median spread.
-This run exceeds the spread ceiling, so the scan ratio is descriptive and the
-scan timing budget is reported inconclusive rather than passed. Point read/write
-remain near the hand-written baseline. The 5-run cross-check is also not an
-accepted scan gate because it is below the minimum repetition count.
+The current native harness uses balanced generated/handwritten process order,
+15 internal scan samples, and a full decoded-row checksum. The prepare-each
+control copies the same fields as the persistent adapters; generated and
+handwritten checksums match. The scan stability rule requires at least 9 process
+runs and no more than 20% process-median spread. This run meets that ceiling and
+the provisional scan budget; the shorter 5-run cross-check is not an accepted
+scan gate. Point-read/write latency and executable `.text` remain near the
+hand-written baseline; no generator optimization was justified by these results.
 
 ESDB's documented concurrency evidence (256 concurrent Store puts across 8 threads, two-process WAL
 writers, abrupt-process recovery) is platform context, not ORM evidence. ORM-specific concurrency tests

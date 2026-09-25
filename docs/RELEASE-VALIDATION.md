@@ -245,32 +245,36 @@ host-scheduling noise in scan timings; the current harness reports scan stabilit
 unstable scan ratio as a pass.
 
 The current interleaved harness was rebuilt and run with both `--repeats 5` and
-`--repeats 9` on Windows/MSVC 19.44 / SQLite 3.53.4. The 9-process run uses 15
-internal scan samples per implementation and balanced generated/handwritten
-execution order. Values below are the 9-run process medians; spread is the
-process-median relative range.
+`--repeats 9` on Windows/MSVC 19.44 / SQLite 3.53.4. The prepare-each control
+now binds the same ID and fully decodes the same four-column row as the
+persistent paths. Point reads and scans consume every decoded field through a
+checksum; generated and handwritten checksums matched exactly
+(`3188731244`). The 9-process run uses 15 internal scan samples per
+implementation and balanced generated/handwritten execution order. Values below
+are the 9-run process medians; spread is the process-median relative range.
 
 | Metric | Generated | Handwritten | Ratio | Spread G/H |
 |---|---:|---:|---:|---:|
-| Point read | 2.145 us/op | 2.201 us/op | 0.975x | 3.6% / 5.6% |
-| Point write | 0.396 us/op | 0.389 us/op | 1.018x | 1.9% / 13.2% |
-| 10k-row scan | 2.098 ms | 2.134 ms | 0.983x | 5.5% / 56.0% |
-| Bulk insert | 879,538 rows/s | 898,804 rows/s | 0.979x | 17.4% / 23.4% |
-| Prepare total | 65.5 us | 59.0 us | 1.110x | 40.8% / 46.9% |
-| Prepare per statement | 10.917 us | 9.833 us | 1.110x | 40.8% / 46.9% |
+| Point read | 2.171 us/op | 2.188 us/op | 0.992x | 15.3% / 7.1% |
+| Point write | 0.395 us/op | 0.395 us/op | 0.998x | 9.1% / 7.2% |
+| 10k-row scan | 2.384 ms | 2.450 ms | 0.973x | 11.7% / 11.1% |
+| Bulk insert | 890,028 rows/s | 912,392 rows/s | 0.975x | 8.7% / 18.3% |
+| Prepare total | 65.3 us | 60.8 us | 1.074x | 108.9% / 86.7% |
+| Prepare per statement | 10.883 us | 10.133 us | 1.074x | 108.9% / 86.7% |
 | SQLite statement memory | 11,800 B | 11,800 B | 1.000x | 0% / 0% |
-| Executable | 46,080 B | 43,008 B | 1.071x | — |
-| Object file | 309,014 B | 278,079 B | 1.111x | — |
+| Executable | 47,616 B | 45,568 B | 1.045x | — |
+| Object file | 319,078 B | 298,036 B | 1.071x | — |
 
 Statement count and reuse were identical (6 statements; reuse true). The scan
-stability check is **UNSTABLE** because the handwritten process-median spread is
-56.0%, above the configured 20% ceiling, despite a 0.983x median ratio. Pooled
-internal scan samples also had broad spread (39.6% generated / 107.3%
-handwritten). The 5-run cross-check measured point read 2.153 / 2.184 us (0.986x),
-write 0.397 / 0.388 us (1.024x), scan 2.089 / 2.156 ms (0.969x), and bulk
-889,601 / 897,400 rows/s (0.991x); it is classified unstable because it is
-below the nine-process minimum. The benchmark is informative in this environment
-and does not claim a scan-budget pass.
+stability check is **STABLE** on this 9-process run: the maximum process-median
+spread is 11.7%, below the configured 20% ceiling, and the 0.973x ratio passes
+the provisional 1.10x scan budget. Pooled internal scan samples still contain
+scheduler outliers (77.5% generated / 78.9% handwritten range), which is why
+the gate uses the distribution of process medians and keeps reporting the raw
+spread. The 5-run check remains unstable by policy because it is below the
+nine-process minimum. `llvm-size` measured executable `.text` at 31,506 / 30,162
+B and object `.text` at 44,636 / 42,031 B (generated / handwritten); the
+produced executable file-size ratio is 1.045x.
 
 ## Typed raw-SQL application-query surface
 

@@ -31,8 +31,16 @@ static const int kPrepareEachReadOps = 10000;
 static const int kWriteOps = 10000;
 static const int kIterations = 7;
 static const int kScanIterations = 15;
+static volatile std::uint32_t g_decoded_row_checksum = 0u;
 
 struct Input {
+    std::int64_t id;
+    std::string name;
+    std::string email;
+    std::int64_t created_at;
+};
+
+struct DecodedRow {
     std::int64_t id;
     std::string name;
     std::string email;
@@ -61,12 +69,49 @@ struct Result {
     sqlite3_int64 statement_memory_bytes;
     int statement_count;
     bool statement_reuse;
+    std::uint32_t decoded_row_checksum;
 };
 
 inline std::uint64_t now_ns() {
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+template <typename Row>
+inline std::uint32_t checksum_row(const Row &row) {
+    std::uint32_t hash = 2166136261u;
+    const std::uint64_t integers[2] = {
+        static_cast<std::uint64_t>(row.id),
+        static_cast<std::uint64_t>(row.created_at)
+    };
+    for (std::size_t field = 0u; field < 2u; ++field) {
+        hash = (hash ^ static_cast<std::uint32_t>(integers[field])) * 16777619u;
+        hash = (hash ^ static_cast<std::uint32_t>(integers[field] >> 32u)) * 16777619u;
+    }
+    const std::string *strings[2] = {&row.name, &row.email};
+    for (std::size_t field = 0u; field < 2u; ++field) {
+        hash = (hash ^ static_cast<std::uint32_t>(strings[field]->size())) * 16777619u;
+        for (std::size_t index = 0u; index < strings[field]->size(); ++index) {
+            hash = (hash ^ static_cast<unsigned char>((*strings[field])[index])) * 16777619u;
+        }
+    }
+    return hash;
+}
+
+template <typename Row>
+inline void observe_row(const Row &row) {
+    g_decoded_row_checksum =
+        (g_decoded_row_checksum ^ checksum_row(row)) * 16777619u;
+}
+
+template <typename Rows>
+inline void observe_rows(const Rows &rows) {
+    std::uint32_t hash = 2166136261u;
+    for (std::size_t index = 0u; index < rows.size(); ++index) {
+        hash = (hash ^ checksum_row(rows[index])) * 16777619u;
+    }
+    g_decoded_row_checksum = (g_decoded_row_checksum ^ hash) * 16777619u;
 }
 
 inline double median(std::vector<double> values) {
@@ -167,36 +212,63 @@ inline sqlite3_int64 allocation_peak_delta() {
     return highwater > current ? highwater - current : 0;
 }
 
-inline bool prepare_each_find_once(sqlite3 *db, std::int64_t id) {
+inline bool read_sqlite_text(sqlite3_stmt *statement, int column, std::string &out) {
+    const unsigned char *text = sqlite3_column_text(statement, column);
+    const int bytes = sqlite3_column_bytes(statement, column);
+    if (bytes < 0 || (!text && bytes > 0)) return false;
+    if (bytes == 0) {
+        out.clear();
+    } else {
+        out.assign(
+            reinterpret_cast<const char *>(text),
+            static_cast<std::size_t>(bytes));
+    }
+    return true;
+}
+
+inline bool prepare_each_find_once(sqlite3 *db, std::int64_t id, DecodedRow *out) {
     static const char sql[] =
         "SELECT \"id\",\"name\",\"email\",\"created_at\" FROM \"user\" WHERE \"id\" = ?";
+    if (db == NULL || out == NULL) return false;
     sqlite3_stmt *statement = NULL;
     int rc = sqlite3_prepare_v3(db, sql, -1, 0u, &statement, NULL);
-    if (rc != SQLITE_OK) return false;
-    rc = sqlite3_bind_int64(statement, 1, static_cast<sqlite3_int64>(id));
+    if (rc != SQLITE_OK || statement == NULL) {
+        sqlite3_finalize(statement);
+        return false;
+    }
+
+    bool ok = sqlite3_bind_parameter_count(statement) == 1 &&
+              sqlite3_column_count(statement) == 4;
+    if (ok) rc = sqlite3_bind_int64(statement, 1, static_cast<sqlite3_int64>(id));
+    else rc = SQLITE_MISMATCH;
     if (rc == SQLITE_OK) rc = sqlite3_step(statement);
     if (rc == SQLITE_ROW) {
-        volatile sqlite3_int64 sink = sqlite3_column_int64(statement, 0);
-        (void)sink;
-        const unsigned char *name = sqlite3_column_text(statement, 1);
-        const unsigned char *email = sqlite3_column_text(statement, 2);
-        if (name == NULL || email == NULL) rc = SQLITE_MISMATCH;
+        out->id = static_cast<std::int64_t>(sqlite3_column_int64(statement, 0));
+        ok = read_sqlite_text(statement, 1, out->name) &&
+             read_sqlite_text(statement, 2, out->email);
+        out->created_at = static_cast<std::int64_t>(sqlite3_column_int64(statement, 3));
+    } else {
+        ok = false;
     }
-    const bool ok = rc == SQLITE_ROW;
     const int finalize_rc = sqlite3_finalize(statement);
     return ok && finalize_rc == SQLITE_OK;
 }
 
 inline double benchmark_prepare_each_point_read(sqlite3 *db) {
+    DecodedRow row;
     for (int i = 0; i < 500; ++i) {
-        if (!prepare_each_find_once(db, static_cast<std::int64_t>((i % kRows) + 1))) return -1.0;
+        if (!prepare_each_find_once(
+                db, static_cast<std::int64_t>((i % kRows) + 1), &row)) return -1.0;
+        observe_row(row);
     }
     std::vector<double> samples;
     samples.reserve(kIterations);
     for (int iteration = 0; iteration < kIterations; ++iteration) {
         const std::uint64_t start = now_ns();
         for (int i = 0; i < kPrepareEachReadOps; ++i) {
-            if (!prepare_each_find_once(db, static_cast<std::int64_t>((i % kRows) + 1))) return -1.0;
+            if (!prepare_each_find_once(
+                    db, static_cast<std::int64_t>((i % kRows) + 1), &row)) return -1.0;
+            observe_row(row);
         }
         const std::uint64_t end = now_ns();
         samples.push_back(
@@ -242,6 +314,7 @@ bool warmup(esdb_database *database, Adapter &adapter) {
 
 template <typename Adapter>
 Result run(const char *implementation, esdb_database *database, double startup_ns) {
+    g_decoded_row_checksum = 0u;
     const std::vector<typename Adapter::InputType> inputs = make_inputs<Adapter>();
 
     const std::uint64_t prepare_start = now_ns();
@@ -297,6 +370,7 @@ Result run(const char *implementation, esdb_database *database, double startup_n
         for (int i = 0; i < kReadOps; ++i) {
             const std::int64_t id = static_cast<std::int64_t>((i % kRows) + 1);
             if (adapter.find(id, &row) != 1) std::exit(5);
+            observe_row(row);
         }
         const std::uint64_t end = now_ns();
         read_samples.push_back(static_cast<double>(end - start) / static_cast<double>(kReadOps));
@@ -331,8 +405,9 @@ Result run(const char *implementation, esdb_database *database, double startup_n
         reset_allocation_highwater();
         const std::uint64_t start = now_ns();
         const int count = adapter.list(kRows, 0, &rows);
-        const std::uint64_t end = now_ns();
         if (count != kRows || rows.size() != static_cast<std::size_t>(kRows)) std::exit(9);
+        observe_rows(rows);
+        const std::uint64_t end = now_ns();
         scan_samples.push_back(static_cast<double>(end - start));
         scan_peak = (std::max)(scan_peak, memory_peak_delta());
         scan_alloc_peak = (std::max)(scan_alloc_peak, allocation_peak_delta());
@@ -386,12 +461,14 @@ Result run(const char *implementation, esdb_database *database, double startup_n
     result.statement_memory_bytes = statement_bytes;
     result.statement_count = statements_before;
     result.statement_reuse = statements_before == statements_after;
+    result.decoded_row_checksum = g_decoded_row_checksum;
     return result;
 }
 
 inline void print_json(const Result &r) {
     std::printf(
         "{\"implementation\":\"%s\","
+        "\"decoded_row_checksum\":%u,"
         "\"startup_ns\":%.3f,"
         "\"prepare_ns\":%.3f,"
         "\"prepare_per_statement_ns\":%.3f,"
@@ -413,6 +490,7 @@ inline void print_json(const Result &r) {
         "\"statement_reuse\":%s,"
         "\"scan_samples_ns\":[",
         r.implementation,
+        static_cast<unsigned int>(r.decoded_row_checksum),
         r.startup_ns,
         r.prepare_ns,
         r.prepare_per_statement_ns,
