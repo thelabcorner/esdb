@@ -5,7 +5,7 @@
   "generator": {
     "name": "esdb-orm-drizzle",
     "source": "examples/orm/user/schema/user.schema.ts",
-    "version": "0.1.0"
+    "version": "0.2.0"
   },
   "ir_version": "esdb.ir/v1",
   "queries": [
