@@ -94,7 +94,7 @@ The project has two deliberately separate layers:
 - **ESDB Runtime** owns SQLite lifecycle, durability policy, transactions, migrations, health, backup, and the storage-backend contract.
 - **ESDB Store** is optional. It adds named object stores, canonical values, monotonic revisions, and pull-based change polling.
 
-A native product such as Workmark can use Runtime with its own relational schema. An ExtendScript utility can eventually use Store as a higher-level state API. Both share the same native engine.
+A native product such as Workmark can use Runtime with its own relational schema. ExtendScript utilities can use Store as a higher-level state/object API. Both share the same native engine.
 
 ESDB is **not** "SQLite exposed to ExtendScript." SQLite is the durable kernel; ESDB defines the lifecycle, portability, typed values, revision model, and Adobe-facing boundary around it.
 
@@ -111,8 +111,8 @@ ESDB is **not** "SQLite exposed to ExtendScript." SQLite is the durable kernel; 
 - integrity and online backup APIs;
 - backend capability and database health snapshots;
 - optional typed Store with durable revisions/change polling;
-- ESABI 0.3.1 ExternalObject adapter;
-- minimal ES3-safe JSX facade with explicit unload lifecycle;
+- ESABI 0.3.1 ExternalObject adapter with transaction + typed Store transport;
+- ES3-safe Store facade with store/get/set/patch/transaction/subscribe, exact INT64/BYTES wrappers, byte-exact UTF-8 transport, and explicit unload lifecycle;
 - native and adapter smoke/hardening tests;
 - live Illustrator 30.6.0 / ExtendScript 4.5.6 facade validation.
 
@@ -200,19 +200,52 @@ if (esdb::Database::open("state.sqlite", &options, db, &error) != ESDB_OK) {
 
 The facade is move-only and status-returning; it does not translate ESDB failures into C++ exceptions.
 
+## ORM compiler (optional)
+
+ESDB also includes an optional compiler-oriented relational layer. It is a
+build-time toolchain over Runtime, not a second runtime engine and not a Store
+dependency.
+
+The v1 authority chain is:
+
+~~~text
+Drizzle schema.ts + named queries
+        -> sealed esdb.ir/v1
+        -> generated C++11 / TypeScript / ES3 / ESABI contracts
+
+drizzle-kit@0.31.11 migration SQL
+        -> deterministic ESDB migration package
+        -> esdb_migrate() / PRAGMA user_version
+~~~
+
+`drizzle-orm@0.45.3` is the pinned schema frontend and the stable
+`drizzle-kit@0.31.11` CLI is the sole production DDL/diff author. Generated
+repositories use persistent prepared statements and bound values only. The generated
+ORM ES3 lane exposes named ESABI operations and does not transport SQL text. ESDB
+also implements a separate bounded typed raw-SQL application-query escape hatch
+for advanced callers; SQL text and typed bound values remain separate and caller
+values are never interpolated. It is not part of the generated ORM v1 surface or
+the production migration authority.
+
+The checked-in User slice under `examples/orm/user/` is executable: CI
+re-extracts the Drizzle schema, verifies deterministic generated artifacts,
+builds/runs the native repository smoke, and builds/runs the concrete ESABI
+bridge smoke. See [docs/ORM_ARCHITECTURE.md](docs/ORM_ARCHITECTURE.md) and
+[tools/esdb-schema/README.md](tools/esdb-schema/README.md).
+
 ## Store
 
 Store is optional and lives in esdb_store.h.
 
 ~~~c
 #include <esdb/esdb.h>
-#include <esdb/esdb_store.h>
+#include <esdb/esdb_object_store.h>
 
 esdb_value *value = NULL;
 uint64_t revision = 0;
 
 esdb_value_create_text(ESDB_VALUE_UTF8, "dark", 4, &value, NULL);
-esdb_store_put(db, "settings", "theme", value, &revision, NULL);
+esdb_object_store_put(db, "settings", "theme", value, &revision, NULL);
 esdb_value_destroy(value);
 ~~~
 
@@ -226,7 +259,7 @@ See [docs/STORE.md](docs/STORE.md).
 
 ## ExtendScript
 
-The current adapter is deliberately thin.
+The JSX facade exposes Store ergonomics while keeping the native adapter typed and SQL-free.
 
 ~~~jsx
 #include "esdb.jsx"
@@ -234,14 +267,39 @@ The current adapter is deliberately thin.
 ESDB.load("lib:ESDB");
 
 var db = ESDB.open(new File("~/my-plugin-state.esdb"));
-$.writeln(db.healthJSON());
-$.writeln(db.dataVersion());
+var settings = db.objectStore("settings").ensure();
+
+settings.set("theme", "dark");
+settings.patch({
+    zoom: 1.25,
+    grid: true
+});
+
+var theme = settings.get("theme");
+var revision = settings.revision(); // exact decimal string
+
+var sub = settings.subscribe("theme", function (change) {
+    $.writeln("theme changed at " + change.revision);
+});
+settings.set("theme", "light");
+sub.poll();
+
 db.close();
+ESDB.unload();
 ~~~
 
-The JSX file passes the shared ESTC ES3 static check and live compile-only parse gate. The current build was also exercised end-to-end inside Illustrator 30.6.0 / ExtendScript 4.5.6 using a uniquely named temporary DLL copy: missing-library recovery, version queries, database open, health/data-version queries, guarded unload, stale-handle rejection, close, zero-handle verification, and final unload all passed.
+INT64 and BYTES stay explicit and lossless:
 
-`ESDB.unload()` refuses to unload while adapter database handles remain open. The ExternalObject adapter does not expose arbitrary SQL, asynchronous JSX callbacks, raw INT64 as a JavaScript Number, or arbitrary bytes through the string channel.
+~~~jsx
+settings.set("counter", ESDB.int64("9007199254740993"));
+settings.set("blob", ESDB.bytes("00FF1080"));
+~~~
+
+ARRAY/OBJECT values use a strict peer codec. ESON is auto-detected when already loaded, or another `{parse,stringify}` codec can be supplied with `ESDB.useStructuredCodec()`. ESON is not bundled into ESDB, preserving ESDB's MIT distribution boundary.
+
+Paths, Store names/keys, UTF-8 values, structured payloads, and BYTES use an ASCII-hex transport around the measured Adobe ExternalObject string-channel limitations. Live validation includes an astral-Unicode database path, astral Store names/keys, embedded U+0000 in values, exact INT64, BYTES, structured ESON objects, transactions, patch, change polling, key-filtered subscriptions, pruning, stale-handle rejection, and guarded unload on Illustrator 30.6.0 / ExtendScript 4.5.6.
+
+`ESDB.unload()` refuses to unload while adapter database handles remain open. The ExternalObject adapter has no asynchronous JSX callbacks. Advanced callers may use `Database.query(sql, parameters, options)` / `run(sql, parameters)`; SQL text and typed parameters cross as separate arguments and values are bound natively, never interpolated.
 
 ## Build
 
@@ -265,11 +323,11 @@ cmake --build --preset vs2022-x64-release
 ctest --preset vs2022-x64-release
 ~~~
 
-ESDB_BUILD_EXTERNALOBJECT=ON builds ESDB.dll on Windows and resolves ESABI 0.3.1 from an exact installed package, ESDB_ESABI_SOURCE_DIR, the sibling ../esabi checkout, or finally the ESABI v0.3.1 release commit `65c9c3ce627a26a89d6bf90547678841df0cf981`. Windows Release native artifacts use MSVC reproducibility flags, and CPack ZIP timestamps are fixed through the release-specific `SOURCE_DATE_EPOCH`; CI checks that two package generations are byte-identical.
+ESDB_BUILD_EXTERNALOBJECT=ON builds ESDB.dll on Windows and resolves ESABI 0.3.1 from an exact installed package, ESDB_ESABI_SOURCE_DIR, the sibling ../esabi checkout, or finally immutable commit `400fefa14c1c09c0e51555f8e834975bdddbdb1d`. The Windows Release DLL uses MSVC reproducibility flags and is byte-identical across the two clean-build directories in the current validation ledger. Release ZIP packaging additionally requires Python 3: CPack uses a fixed `SOURCE_DATE_EPOCH` and post-build timestamp normalization without recompressing payloads, and CI verifies that two package generations are byte-identical.
 
 ## Validation
 
-Current automated coverage includes C/C++ smoke, strict open-option validation and configuration readback, transactions, rollback, savepoints, migration rollback, canonical Store values, semantic Store corruption detection, revision metadata/sequence consistency, revision continuity after full prune and reopen, signed-64 revision bounds, read-only Store access, concurrent Store writer serialization, simultaneous same-connection Store readers/writers, coherent change-window snapshots, subscription reentrancy/BUSY handling, abrupt-process WAL recovery, two-process concurrent WAL writers, C++ callback containment, integrity/backup, backend capabilities, generation-tagged ExternalObject handles, and thread-local adapter staging.
+Current automated coverage includes C/C++ smoke, strict open-option validation and configuration readback, transactions, rollback, savepoints, migration rollback, canonical Store values, semantic Store corruption detection, revision metadata/sequence consistency, revision continuity after full prune and reopen, signed-64 revision bounds, read-only Store access, concurrent Store writer serialization, simultaneous same-connection Store readers/writers, coherent change-window snapshots, subscription reentrancy/BUSY handling, abrupt-process WAL recovery, two-process concurrent WAL writers, C++ callback containment, integrity/backup, backend capabilities, generation-tagged ExternalObject handles, and thread-local adapter staging. The ORM lane additionally gates sealed-IR drift, Drizzle extraction, deterministic model/migration generation, strict U1 parsing, C++11 generated bindings, migration linting/provenance, real native CRUD/migration execution, and the concrete named-operation ESABI bridge.
 
 Illustrator 30.6.0 / ExtendScript 4.5.6 additionally passes the live ESTC parser gate and an end-to-end facade/DLL lifecycle smoke. ESDB now has first smoke-level abrupt-process recovery and two-process WAL-writer evidence; a broader fault-injection matrix and longer multi-process qualification remain future backend/release evidence. The exact evidence and qualification boundaries are preserved in [docs/RELEASE-VALIDATION.md](docs/RELEASE-VALIDATION.md).
 
@@ -299,8 +357,8 @@ esdb/
 
 - The only shipped storage backend is plain SQLite.
 - Transparent compression is not implemented yet.
-- The JSX facade is lifecycle/health-only; the full Store API is not exposed through ExternalObject yet.
-- Change-log pruning is explicit; v0.1 does not synthesize a revision-gap event for consumers that request history already pruned.
+- The JSX facade exposes durable ObjectStore and process-memory Store APIs plus synchronous pull-based change polling; asynchronous callbacks are not supported.
+- Durable ObjectStore pruning is explicit and does not synthesize a gap event in v0.1; the process-memory Store instead bounds its journal and exposes retained-floor/gap status.
 - A database must outlive its transaction/savepoint/subscription handles.
 - FULLMUTEX protects individual SQLite connection calls, and ESDB serializes Store mutations plus invariant-sensitive Store reads, but multi-call application transaction sequences still require application-level serialization.
 - Live Illustrator runtime behavior is currently qualified on Illustrator 30.6.0 / ExtendScript 4.5.6 only; other host versions still require their own compatibility evidence.

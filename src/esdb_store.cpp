@@ -1,865 +1,251 @@
 #include "esdb_internal.hpp"
 
+#include <esdb/esdb_store.h>
+
+#include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <deque>
+#include <map>
+#include <memory>
 #include <new>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace {
 
-struct OwnedChange {
+struct ByteLess {
+    bool operator()(const std::string &left, const std::string &right) const noexcept {
+        const std::size_t common = std::min(left.size(), right.size());
+        for (std::size_t i = 0; i < common; ++i) {
+            const unsigned char a = static_cast<unsigned char>(left[i]);
+            const unsigned char b = static_cast<unsigned char>(right[i]);
+            if (a < b) return true;
+            if (a > b) return false;
+        }
+        return left.size() < right.size();
+    }
+};
+
+struct MemoryRecord {
+    esdb_value value;
     std::uint64_t revision = 0u;
-    esdb_change_operation operation = ESDB_CHANGE_PUT;
+};
+
+struct MemoryChange {
+    std::uint64_t revision = 0u;
+    esdb_store_change_operation operation = ESDB_STORE_CHANGE_PUT;
     esdb_value_type value_type = ESDB_VALUE_NULL;
-    std::string store_name;
     std::string key;
 };
 
-bool valid_value_type(int type) noexcept {
-    return type >= static_cast<int>(ESDB_VALUE_NULL) &&
-           type <= static_cast<int>(ESDB_VALUE_OBJECT);
-}
+struct MemoryStoreState {
+    explicit MemoryStoreState(std::string store_name)
+        : name(std::move(store_name)) {}
 
-bool parse_revision_text(const char *text, std::uint64_t *out) noexcept {
-    if (!text || !text[0] || !out) return false;
-    if (text[0] == '0' && text[1] != '\0') return false;
-    std::uint64_t value = 0u;
-    for (const unsigned char *p =
-             reinterpret_cast<const unsigned char *>(text);
-         *p;
-         ++p) {
-        if (*p < static_cast<unsigned char>('0') ||
-            *p > static_cast<unsigned char>('9')) {
-            return false;
-        }
-        const std::uint64_t digit =
-            static_cast<std::uint64_t>(*p - static_cast<unsigned char>('0'));
-        if (value > (ESDB_REVISION_MAX - digit) / 10u) return false;
-        value = value * 10u + digit;
-    }
-    *out = value;
-    return true;
-}
-
-esdb_status read_store_revision_metadata(
-    esdb_database *database,
-    std::uint64_t *out_revision,
-    esdb_error *error) noexcept {
-    if (!database || !database->handle || !out_revision) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
-            database ? database->handle : nullptr, SQLITE_MISUSE,
-            "database and out revision are required");
-    }
-
-    esdb_detail::Statement statement;
-    esdb_status status = statement.prepare(
-        database,
-        "SELECT m.value, COALESCE(("
-        " SELECT seq FROM sqlite_sequence WHERE name='__esdb_changes'"
-        "),0) "
-        "FROM __esdb_meta m WHERE m.key='store_revision';",
-        ESDB_PHASE_STORE,
-        error);
-    if (status != ESDB_OK) return status;
-
-    int step = 0;
-    status = statement.step(database, &step, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-    if (step != SQLITE_ROW) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_CORRUPT, ESDB_PHASE_STORE,
-            database->handle, SQLITE_CORRUPT,
-            "missing ESDB Store revision metadata");
-    }
-
-    if (sqlite3_column_type(statement.get(), 0) != SQLITE_TEXT ||
-        sqlite3_column_type(statement.get(), 1) != SQLITE_INTEGER) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_CORRUPT, ESDB_PHASE_STORE,
-            database->handle, SQLITE_CORRUPT,
-            "ESDB Store revision metadata has an invalid storage type");
-    }
-    const char *text = reinterpret_cast<const char *>(
-        sqlite3_column_text(statement.get(), 0));
-    const sqlite3_int64 sequence = sqlite3_column_int64(statement.get(), 1);
+    std::string name;
+    esdb_detail::NoThrowMutex mutex;
+    std::map<std::string, MemoryRecord, ByteLess> records;
+    std::deque<MemoryChange> changes;
     std::uint64_t revision = 0u;
-    if (!parse_revision_text(text, &revision) || sequence < 0 ||
-        revision != static_cast<std::uint64_t>(sequence)) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_CORRUPT, ESDB_PHASE_STORE,
-            database->handle, SQLITE_CORRUPT,
-            "ESDB Store revision metadata is inconsistent");
-    }
-
-    *out_revision = revision;
-    return ESDB_OK;
-}
-
-esdb_status inspect_store_table_count(
-    esdb_database *database,
-    int *out_count,
-    esdb_error *error) noexcept {
-    if (!database || !database->handle || !out_count) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
-            database ? database->handle : nullptr, SQLITE_MISUSE,
-            "database and out table count are required");
-    }
-
-    esdb_detail::Statement tables;
-    esdb_status status = tables.prepare(
-        database,
-        "SELECT COUNT(*) FROM sqlite_master "
-        "WHERE type='table' AND name IN("
-        "'__esdb_meta','__esdb_stores','__esdb_records','__esdb_changes'"
-        ");",
-        ESDB_PHASE_STORE,
-        error);
-    if (status != ESDB_OK) return status;
-
-    int step = 0;
-    status = tables.step(database, &step, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-    if (step != SQLITE_ROW) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_SQLITE, ESDB_PHASE_STORE,
-            database->handle, SQLITE_ERROR,
-            "failed to inspect ESDB Store schema");
-    }
-
-    const int count = sqlite3_column_int(tables.get(), 0);
-    if (count < 0 || count > 4) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_CORRUPT, ESDB_PHASE_STORE,
-            database->handle, SQLITE_CORRUPT,
-            "ESDB Store schema table count is invalid");
-    }
-    *out_count = count;
-    return ESDB_OK;
-}
-
-esdb_status require_store_writable(
-    esdb_database *database,
-    esdb_error *error) noexcept {
-    if (!database || !database->handle) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
-            database ? database->handle : nullptr, SQLITE_MISUSE,
-            "database is required");
-    }
-    const int read_only = sqlite3_db_readonly(database->handle, "main");
-    if (read_only < 0) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_INTERNAL, ESDB_PHASE_STORE,
-            database->handle, SQLITE_ERROR,
-            "SQLite main database was not found");
-    }
-    if (read_only != 0) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_IO, ESDB_PHASE_STORE,
-            database->handle, SQLITE_READONLY,
-            "ESDB Store mutation requires a writable database");
-    }
-    return ESDB_OK;
-}
-
-esdb_status invalid_revision(
-    esdb_database *database,
-    esdb_error *error,
-    esdb_phase phase,
-    const char *message) noexcept {
-    return esdb_detail::fail(
-        database,
-        error,
-        ESDB_ERR_INVALID_ARGUMENT,
-        phase,
-        database ? database->handle : nullptr,
-        SQLITE_RANGE,
-        message);
-}
-
-struct StoreMutationScope {
-    bool active = false;
-    bool owns_transaction = false;
+    std::uint64_t retained_floor = 0u;
+    std::atomic<std::uint32_t> handle_count{0u};
+    std::atomic<std::uint32_t> subscription_count{0u};
 };
 
-void sync_internal_transaction_state(esdb_database *database) noexcept {
-    if (!database || !database->handle) return;
-    std::lock_guard<esdb_detail::NoThrowMutex> lock(database->state_mutex);
-    database->transaction_active =
-        sqlite3_get_autocommit(database->handle) == 0;
-    if (!database->transaction_active) database->savepoint_depth = 0u;
+struct OwnedRecord {
+    std::string key;
+    esdb_value value;
+    std::uint64_t revision = 0u;
+};
+
+struct OwnedChange {
+    std::uint64_t revision = 0u;
+    esdb_store_change_operation operation = ESDB_STORE_CHANGE_PUT;
+    esdb_value_type value_type = ESDB_VALUE_NULL;
+    std::string key;
+};
+
+esdb_detail::NoThrowMutex &registry_mutex() {
+    static esdb_detail::NoThrowMutex mutex;
+    return mutex;
 }
 
-esdb_status begin_store_mutation(
-    esdb_database *database,
-    StoreMutationScope *scope,
-    esdb_error *error) noexcept {
-    if (!database || !database->handle || !scope) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
-            database ? database->handle : nullptr, SQLITE_MISUSE,
-            "invalid Store mutation scope");
-    }
-
-    scope->active = false;
-    scope->owns_transaction = sqlite3_get_autocommit(database->handle) != 0;
-
-    const char *sql = scope->owns_transaction
-        ? "BEGIN IMMEDIATE;"
-        : "SAVEPOINT __esdb_mutation;";
-    const esdb_status status =
-        esdb_detail::exec_sql(database, sql, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-
-    scope->active = true;
-    if (scope->owns_transaction) sync_internal_transaction_state(database);
-    return ESDB_OK;
+std::unordered_map<std::string, std::shared_ptr<MemoryStoreState>> &registry() {
+    static std::unordered_map<std::string, std::shared_ptr<MemoryStoreState>> stores;
+    return stores;
 }
 
-void rollback_store_mutation(
-    esdb_database *database,
-    StoreMutationScope *scope) noexcept {
-    if (!scope || !scope->active) return;
-
-    if (scope->owns_transaction) {
-        if (esdb_detail::exec_sql(
-                database, "ROLLBACK;", ESDB_PHASE_STORE, nullptr) == ESDB_OK) {
-            esdb_detail::count_rollback(database);
-        }
-        sync_internal_transaction_state(database);
-    } else {
-        esdb_detail::exec_sql(
-            database,
-            "ROLLBACK TO __esdb_mutation; RELEASE __esdb_mutation;",
-            ESDB_PHASE_STORE,
-            nullptr);
-    }
-    scope->active = false;
+bool valid_value_type(esdb_value_type type) noexcept {
+    return type >= ESDB_VALUE_NULL && type <= ESDB_VALUE_OBJECT;
 }
 
-esdb_status commit_store_mutation(
-    esdb_database *database,
-    StoreMutationScope *scope,
-    esdb_error *error) noexcept {
-    if (!scope || !scope->active) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_INVALID_STATE, ESDB_PHASE_STORE,
-            database ? database->handle : nullptr, SQLITE_MISUSE,
-            "Store mutation scope is not active");
-    }
-
-    const char *sql = scope->owns_transaction
-        ? "COMMIT;"
-        : "RELEASE __esdb_mutation;";
-    const esdb_status status =
-        esdb_detail::exec_sql(database, sql, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) {
-        rollback_store_mutation(database, scope);
-        return status;
-    }
-
-    if (scope->owns_transaction) {
-        esdb_detail::count_commit(database);
-        sync_internal_transaction_state(database);
-    }
-    scope->active = false;
-    return ESDB_OK;
+bool valid_name(const char *text) noexcept {
+    if (!esdb_detail::valid_c_string(text, ESDB_STORE_NAME_MAX_BYTES)) return false;
+    return esdb_detail::valid_utf8(text, static_cast<std::uint64_t>(std::strlen(text)));
 }
 
-esdb_status set_store_revision(
-    esdb_database *database,
-    sqlite3_int64 revision,
-    esdb_error *error) noexcept {
-    esdb_detail::Statement statement;
-    esdb_status status = statement.prepare(
-        database,
-        "INSERT INTO __esdb_meta(key,value) VALUES('store_revision',CAST(?1 AS TEXT)) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value;",
-        ESDB_PHASE_STORE,
-        error);
-    if (status != ESDB_OK) return status;
-
-    status = statement.bind_int64(
-        database, 1, revision, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-
-    int step = 0;
-    status = statement.step(database, &step, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-    if (step != SQLITE_DONE) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_SQLITE, ESDB_PHASE_STORE,
-            database->handle, SQLITE_ERROR,
-            "store revision update did not finish");
-    }
-    return ESDB_OK;
+bool valid_key(const char *text) noexcept {
+    if (!esdb_detail::valid_c_string(text, ESDB_STORE_KEY_MAX_BYTES)) return false;
+    return esdb_detail::valid_utf8(text, static_cast<std::uint64_t>(std::strlen(text)));
 }
 
-esdb_status get_store_id(
-    esdb_database *database,
-    const char *name,
-    sqlite3_int64 *out_id,
-    bool create,
-    esdb_error *error) noexcept {
-    if (!out_id) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
-            database ? database->handle : nullptr, SQLITE_MISUSE,
-            "out store id is required");
-    }
-
-    if (create) {
-        esdb_detail::Statement insert;
-        esdb_status status = insert.prepare(
-            database,
-            "INSERT INTO __esdb_stores(name, created_at_ms) VALUES(?1, ?2) "
-            "ON CONFLICT(name) DO NOTHING;",
-            ESDB_PHASE_STORE,
-            error);
-        if (status != ESDB_OK) return status;
-
-        status = insert.bind_text(
-            database, 1, name, -1, ESDB_PHASE_STORE, error);
-        if (status != ESDB_OK) return status;
-        status = insert.bind_int64(
-            database, 2, esdb_detail::unix_time_ms(),
-            ESDB_PHASE_STORE, error);
-        if (status != ESDB_OK) return status;
-
-        int step = 0;
-        status = insert.step(database, &step, ESDB_PHASE_STORE, error);
-        if (status != ESDB_OK) return status;
-        if (step != SQLITE_DONE) {
-            return esdb_detail::fail(
-                database, error, ESDB_ERR_SQLITE, ESDB_PHASE_STORE,
-                database->handle, SQLITE_ERROR,
-                "store registration did not finish");
-        }
-    }
-
-    esdb_detail::Statement query;
-    esdb_status status = query.prepare(
-        database,
-        "SELECT id FROM __esdb_stores WHERE name=?1;",
-        ESDB_PHASE_STORE,
-        error);
-    if (status != ESDB_OK) return status;
-    status = query.bind_text(
-        database, 1, name, -1, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-
-    int step = 0;
-    status = query.step(database, &step, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-    if (step == SQLITE_DONE) return ESDB_ERR_NOT_FOUND;
-
-    *out_id = sqlite3_column_int64(query.get(), 0);
-    return ESDB_OK;
+esdb_status store_fail(
+    esdb_error *error,
+    esdb_status status,
+    esdb_phase phase,
+    const char *message) noexcept {
+    esdb_detail::set_error(error, status, phase, nullptr, 0, message);
+    return status;
 }
 
-esdb_status insert_change(
-    esdb_database *database,
-    sqlite3_int64 store_id,
-    const char *key,
-    esdb_change_operation operation,
-    esdb_value_type value_type,
-    sqlite3_int64 changed_at_ms,
-    sqlite3_int64 *out_revision,
-    esdb_error *error) noexcept {
-    if (!out_revision) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
-            database ? database->handle : nullptr, SQLITE_MISUSE,
-            "out revision is required");
-    }
-
-    esdb_detail::Statement statement;
-    esdb_status status = statement.prepare(
-        database,
-        "INSERT INTO __esdb_changes("
-        "store_id,key,operation,value_type,changed_at_ms"
-        ") VALUES(?1,?2,?3,?4,?5) RETURNING revision;",
-        ESDB_PHASE_STORE,
-        error);
-    if (status != ESDB_OK) return status;
-
-    status = statement.bind_int64(
-        database, 1, store_id, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-    status = statement.bind_text(
-        database, 2, key, -1, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-    status = statement.bind_int(
-        database, 3, static_cast<int>(operation),
-        ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-    status = statement.bind_int(
-        database, 4, static_cast<int>(value_type),
-        ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-    status = statement.bind_int64(
-        database, 5, changed_at_ms, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-
-    int step = 0;
-    status = statement.step(database, &step, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-    if (step != SQLITE_ROW) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_SQLITE, ESDB_PHASE_STORE,
-            database->handle, SQLITE_ERROR,
-            "change insert returned no revision");
-    }
-
-    const sqlite3_int64 revision = sqlite3_column_int64(statement.get(), 0);
-    if (revision <= 0) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_CORRUPT, ESDB_PHASE_STORE,
-            database->handle, SQLITE_CORRUPT,
-            "change insert returned an invalid revision");
-    }
-
-    status = statement.step(database, &step, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-    if (step != SQLITE_DONE) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_SQLITE, ESDB_PHASE_STORE,
-            database->handle, SQLITE_ERROR,
-            "change insert did not finish");
-    }
-
-    *out_revision = revision;
-    return ESDB_OK;
-}
-
-esdb_status clone_sql_value(
-    sqlite3_stmt *statement,
-    int type_column,
-    int payload_column,
+esdb_status clone_value(
+    const esdb_value *source,
     esdb_value **out_value,
-    esdb_database *database,
-    esdb_error *error) noexcept {
-    const int raw_type = sqlite3_column_int(statement, type_column);
-    if (!valid_value_type(raw_type)) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_CORRUPT, ESDB_PHASE_STORE,
-            database->handle, SQLITE_CORRUPT,
-            "record contains an unknown ESDB value type");
+    esdb_error *error,
+    esdb_phase phase) noexcept {
+    if (out_value) *out_value = nullptr;
+    if (!source || !out_value || !valid_value_type(source->type)) {
+        return store_fail(
+            error, ESDB_ERR_INVALID_ARGUMENT, phase,
+            "invalid Store value clone arguments");
     }
 
-    if (sqlite3_column_type(statement, payload_column) != SQLITE_BLOB) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_CORRUPT, ESDB_PHASE_STORE,
-            database->handle, SQLITE_CORRUPT,
-            "record payload is not a canonical BLOB");
-    }
-    const void *blob = sqlite3_column_blob(statement, payload_column);
-    const int bytes = sqlite3_column_bytes(statement, payload_column);
-    if (bytes < 0 || (bytes > 0 && !blob)) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_CORRUPT, ESDB_PHASE_STORE,
-            database->handle, SQLITE_CORRUPT,
-            "record payload is invalid");
+    esdb_value *copy = new (std::nothrow) esdb_value();
+    if (!copy) {
+        return store_fail(
+            error, ESDB_ERR_OUT_OF_MEMORY, phase,
+            "failed to allocate Store value");
     }
 
-    const auto type = static_cast<esdb_value_type>(raw_type);
-    bool payload_valid = true;
-    switch (type) {
-        case ESDB_VALUE_NULL:
-            payload_valid = bytes == 0;
-            break;
-        case ESDB_VALUE_BOOL:
-            payload_valid = bytes == 1 && blob &&
-                (*static_cast<const std::uint8_t *>(blob) == 0u ||
-                 *static_cast<const std::uint8_t *>(blob) == 1u);
-            break;
-        case ESDB_VALUE_INT32:
-            payload_valid = bytes == 4;
-            break;
-        case ESDB_VALUE_INT64:
-        case ESDB_VALUE_DOUBLE:
-            payload_valid = bytes == 8;
-            break;
-        case ESDB_VALUE_UTF8:
-        case ESDB_VALUE_ARRAY:
-        case ESDB_VALUE_OBJECT:
-            payload_valid = esdb_detail::valid_utf8(
-                static_cast<const char *>(blob),
-                static_cast<std::uint64_t>(bytes));
-            break;
-        case ESDB_VALUE_BYTES:
-            break;
-        default:
-            payload_valid = false;
-            break;
-    }
-    if (!payload_valid) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_CORRUPT, ESDB_PHASE_STORE,
-            database->handle, SQLITE_CORRUPT,
-            "record payload violates its ESDB value type");
-    }
-
-    esdb_value *value = new (std::nothrow) esdb_value();
-    if (!value) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_OUT_OF_MEMORY, ESDB_PHASE_STORE,
-            database->handle, SQLITE_NOMEM,
-            "value allocation failed");
-    }
-
-    value->type = type;
     try {
-        if (bytes > 0) {
-            const auto *begin = static_cast<const std::uint8_t *>(blob);
-            value->payload.assign(begin, begin + bytes);
-        }
+        copy->type = source->type;
+        copy->payload = source->payload;
     } catch (...) {
-        delete value;
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_OUT_OF_MEMORY, ESDB_PHASE_STORE,
-            database->handle, SQLITE_NOMEM,
-            "value payload allocation failed");
+        delete copy;
+        return store_fail(
+            error, ESDB_ERR_OUT_OF_MEMORY, phase,
+            "failed to copy Store value payload");
     }
 
-    *out_value = value;
+    *out_value = copy;
     return ESDB_OK;
+}
+
+void retain_change(MemoryStoreState &state, MemoryChange &&change) {
+    state.changes.emplace_back(std::move(change));
+    while (state.changes.size() > ESDB_STORE_CHANGE_CAPACITY) {
+        state.retained_floor = state.changes.front().revision;
+        state.changes.pop_front();
+    }
 }
 
 }  // namespace
 
-namespace esdb_detail {
+struct esdb_store {
+    std::shared_ptr<MemoryStoreState> state;
+};
 
-esdb_status ensure_store_schema(
-    esdb_database *database,
-    esdb_error *error) noexcept {
-    clear_error(error);
-    if (!database || !database->handle) {
-        return fail(
-            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
-            nullptr, SQLITE_MISUSE, "database is required");
+struct esdb_store_subscription {
+    std::shared_ptr<MemoryStoreState> state;
+    std::atomic<std::uint64_t> revision{0u};
+    esdb_detail::NoThrowMutex poll_mutex;
+};
+
+namespace {
+
+esdb_status validate_store(
+    esdb_store *store,
+    esdb_error *error,
+    esdb_phase phase) {
+    if (!store || !store->state) {
+        return store_fail(
+            error, ESDB_ERR_INVALID_ARGUMENT, phase,
+            "Store handle is required");
     }
-
-    std::lock_guard<esdb_detail::NoThrowMutex> schema_lock(
-        database->store_schema_mutex);
-    if (database->store_schema_ready) return ESDB_OK;
-
-    const int read_only = sqlite3_db_readonly(database->handle, "main");
-    if (read_only < 0) {
-        return fail(
-            database, error, ESDB_ERR_INTERNAL, ESDB_PHASE_STORE,
-            database->handle, SQLITE_ERROR,
-            "SQLite main database was not found");
-    }
-
-    esdb_status status = ESDB_OK;
-    int store_table_count = 0;
-    status = inspect_store_table_count(database, &store_table_count, error);
-    if (status != ESDB_OK) return status;
-
-    if (store_table_count != 0 && store_table_count != 4) {
-        return fail(
-            database, error, ESDB_ERR_CORRUPT, ESDB_PHASE_STORE,
-            database->handle, SQLITE_CORRUPT,
-            "ESDB Store schema is only partially present");
-    }
-
-    if (store_table_count == 0) {
-        if (read_only != 0) {
-            return fail(
-                database, error, ESDB_ERR_NOT_FOUND, ESDB_PHASE_STORE,
-                database->handle, SQLITE_NOTFOUND,
-                "ESDB Store schema is not present in the read-only database");
-        }
-
-        StoreMutationScope schema_scope{};
-        status = begin_store_mutation(database, &schema_scope, error);
-        if (status != ESDB_OK) return status;
-
-        /*
-         * Re-read after acquiring the write lock. Another process may have
-         * initialized the Store between our optimistic inspection and
-         * BEGIN IMMEDIATE.
-         */
-        status = inspect_store_table_count(
-            database, &store_table_count, error);
-        if (status != ESDB_OK) {
-            rollback_store_mutation(database, &schema_scope);
-            return status;
-        }
-        if (store_table_count != 0 && store_table_count != 4) {
-            rollback_store_mutation(database, &schema_scope);
-            return fail(
-                database, error, ESDB_ERR_CORRUPT, ESDB_PHASE_STORE,
-                database->handle, SQLITE_CORRUPT,
-                "ESDB Store schema is only partially present");
-        }
-
-        if (store_table_count == 0) {
-            const char *schema_sql =
-                "CREATE TABLE __esdb_meta("
-                " key TEXT PRIMARY KEY,"
-                " value TEXT NOT NULL"
-                ") WITHOUT ROWID;"
-                "CREATE TABLE __esdb_stores("
-                " id INTEGER PRIMARY KEY,"
-                " name TEXT NOT NULL UNIQUE,"
-                " created_at_ms INTEGER NOT NULL"
-                ");"
-                "CREATE TABLE __esdb_records("
-                " store_id INTEGER NOT NULL,"
-                " key TEXT NOT NULL,"
-                " type INTEGER NOT NULL,"
-                " value BLOB NOT NULL,"
-                " revision INTEGER NOT NULL,"
-                " created_at_ms INTEGER NOT NULL,"
-                " updated_at_ms INTEGER NOT NULL,"
-                " PRIMARY KEY(store_id, key),"
-                " FOREIGN KEY(store_id) REFERENCES __esdb_stores(id) ON DELETE CASCADE"
-                ") WITHOUT ROWID;"
-                "CREATE TABLE __esdb_changes("
-                " revision INTEGER PRIMARY KEY AUTOINCREMENT,"
-                " store_id INTEGER NOT NULL,"
-                " key TEXT NOT NULL,"
-                " operation INTEGER NOT NULL,"
-                " value_type INTEGER NOT NULL,"
-                " changed_at_ms INTEGER NOT NULL,"
-                " FOREIGN KEY(store_id) REFERENCES __esdb_stores(id) ON DELETE CASCADE"
-                ");"
-                "CREATE INDEX __esdb_changes_store_revision "
-                " ON __esdb_changes(store_id, revision);"
-                "INSERT INTO __esdb_meta(key, value) "
-                " VALUES('store_schema_version','1');"
-                "INSERT INTO __esdb_meta(key, value) "
-                " VALUES('store_revision','0');";
-
-            status = exec_sql(
-                database, schema_sql, ESDB_PHASE_STORE, error);
-            if (status != ESDB_OK) {
-                rollback_store_mutation(database, &schema_scope);
-                return status;
-            }
-        }
-
-        status = commit_store_mutation(
-            database, &schema_scope, error);
-        if (status != ESDB_OK) return status;
-    }
-
-    Statement statement;
-    status = statement.prepare(
-        database,
-        "SELECT value FROM __esdb_meta "
-        "WHERE key='store_schema_version';",
-        ESDB_PHASE_STORE,
-        error);
-    if (status != ESDB_OK) return status;
-
-    int step = 0;
-    status = statement.step(database, &step, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-    if (step != SQLITE_ROW) {
-        return fail(
-            database, error, ESDB_ERR_CORRUPT, ESDB_PHASE_STORE,
-            database->handle, SQLITE_CORRUPT,
-            "missing ESDB Store schema version");
-    }
-
-    if (sqlite3_column_type(statement.get(), 0) != SQLITE_TEXT) {
-        return fail(
-            database, error, ESDB_ERR_CORRUPT, ESDB_PHASE_STORE,
-            database->handle, SQLITE_CORRUPT,
-            "ESDB Store schema version has an invalid storage type");
-    }
-    const auto *version =
-        reinterpret_cast<const char *>(sqlite3_column_text(statement.get(), 0));
-    if (!version || std::strcmp(version, "1") != 0) {
-        return fail(
-            database, error, ESDB_ERR_UNSUPPORTED, ESDB_PHASE_STORE,
-            database->handle, SQLITE_MISMATCH,
-            "unsupported ESDB Store schema version");
-    }
-
-    std::uint64_t current_revision = 0u;
-    status = read_store_revision_metadata(database, &current_revision, error);
-    if (status != ESDB_OK) return status;
-
-    database->store_schema_ready = true;
     return ESDB_OK;
 }
 
-esdb_status store_changes_since_impl(
-    esdb_database *database,
-    const char *store_name_or_null,
+esdb_status changes_since_impl(
+    const std::shared_ptr<MemoryStoreState> &state,
     std::uint64_t after_revision,
     std::uint32_t limit,
-    esdb_change_callback callback,
+    esdb_store_change_callback callback,
     void *user_data,
     std::uint64_t *out_last_revision,
     std::uint32_t *out_change_count,
     esdb_error *error) noexcept {
-    clear_error(error);
+    esdb_detail::clear_error(error);
     if (out_last_revision) *out_last_revision = after_revision;
     if (out_change_count) *out_change_count = 0u;
 
-    if (!database || !database->handle || !callback ||
-        limit > ESDB_CHANGE_LIMIT_MAX) {
-        return fail(
-            database, error, ESDB_ERR_INVALID_ARGUMENT,
-            ESDB_PHASE_SUBSCRIPTION,
-            database ? database->handle : nullptr,
-            SQLITE_MISUSE,
-            "invalid change query arguments");
+    if (!state || !callback || limit > ESDB_STORE_CHANGE_LIMIT_MAX ||
+        after_revision > ESDB_REVISION_MAX) {
+        return store_fail(
+            error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_SUBSCRIPTION,
+            "invalid Store change query arguments");
     }
-    if (after_revision > ESDB_REVISION_MAX) {
-        return invalid_revision(
-            database, error, ESDB_PHASE_SUBSCRIPTION,
-            "after_revision exceeds the ESDB revision domain");
-    }
-    if (store_name_or_null && !valid_store_name(store_name_or_null)) {
-        return fail(
-            database, error, ESDB_ERR_INVALID_ARGUMENT,
-            ESDB_PHASE_SUBSCRIPTION,
-            database->handle, SQLITE_MISMATCH,
-            "invalid store name");
-    }
-    if (limit == 0u) limit = ESDB_CHANGE_LIMIT_MAX;
+    if (limit == 0u) limit = ESDB_STORE_CHANGE_LIMIT_MAX;
 
     std::vector<OwnedChange> snapshot;
     try {
         snapshot.reserve(limit < 256u ? limit : 256u);
-
         {
-            /*
-             * A Store writer is a multi-statement SQLite sequence. SQLite's
-             * FULLMUTEX protects individual calls, not the invariant between
-             * the change row, record row, and revision metadata. Serialize
-             * this snapshot against Store writers, then release the mutex
-             * before invoking user callbacks.
-             */
-            std::lock_guard<esdb_detail::NoThrowMutex> store_lock(
-                database->store_write_mutex);
-
-            esdb_status status = ensure_store_schema(database, error);
-            if (status != ESDB_OK) return status;
-
-            const char *sql =
-                store_name_or_null
-                    ? "SELECT c.revision,c.operation,c.value_type,s.name,c.key "
-                      "FROM __esdb_changes c "
-                      "JOIN __esdb_stores s ON s.id=c.store_id "
-                      "WHERE c.revision>?1 AND s.name=?2 "
-                      "ORDER BY c.revision ASC LIMIT ?3;"
-                    : "SELECT c.revision,c.operation,c.value_type,s.name,c.key "
-                      "FROM __esdb_changes c "
-                      "JOIN __esdb_stores s ON s.id=c.store_id "
-                      "WHERE c.revision>?1 "
-                      "ORDER BY c.revision ASC LIMIT ?2;";
-
-            Statement statement;
-            status = statement.prepare(
-                database, sql, ESDB_PHASE_SUBSCRIPTION, error);
-            if (status != ESDB_OK) return status;
-            status = statement.bind_int64(
-                database, 1, static_cast<sqlite3_int64>(after_revision),
-                ESDB_PHASE_SUBSCRIPTION, error);
-            if (status != ESDB_OK) return status;
-
-            if (store_name_or_null) {
-                status = statement.bind_text(
-                    database, 2, store_name_or_null, -1,
-                    ESDB_PHASE_SUBSCRIPTION, error);
-                if (status != ESDB_OK) return status;
-                status = statement.bind_int(
-                    database, 3, static_cast<int>(limit),
-                    ESDB_PHASE_SUBSCRIPTION, error);
-            } else {
-                status = statement.bind_int(
-                    database, 2, static_cast<int>(limit),
-                    ESDB_PHASE_SUBSCRIPTION, error);
+            std::lock_guard<esdb_detail::NoThrowMutex> lock(state->mutex);
+            if (after_revision > state->revision) {
+                return store_fail(
+                    error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_SUBSCRIPTION,
+                    "after_revision is newer than the Store");
             }
-            if (status != ESDB_OK) return status;
+            if (after_revision < state->retained_floor) {
+                return store_fail(
+                    error, ESDB_ERR_GAP, ESDB_PHASE_SUBSCRIPTION,
+                    "requested Store history is older than the retained change floor");
+            }
 
-            while (true) {
-                int step = 0;
-                status = statement.step(
-                    database, &step, ESDB_PHASE_SUBSCRIPTION, error);
-                if (status != ESDB_OK) return status;
-                if (step == SQLITE_DONE) break;
-
-                const sqlite3_int64 raw_revision =
-                    sqlite3_column_int64(statement.get(), 0);
-                const auto operation = static_cast<esdb_change_operation>(
-                    sqlite3_column_int(statement.get(), 1));
-                const auto value_type = static_cast<esdb_value_type>(
-                    sqlite3_column_int(statement.get(), 2));
-                const char *store_name = reinterpret_cast<const char *>(
-                    sqlite3_column_text(statement.get(), 3));
-                const char *key = reinterpret_cast<const char *>(
-                    sqlite3_column_text(statement.get(), 4));
-
-                if (raw_revision <= 0 ||
-                    !store_name || !key ||
-                    !valid_store_name(store_name) ||
-                    !valid_store_key(key) ||
-                    !valid_value_type(static_cast<int>(value_type)) ||
-                    (operation != ESDB_CHANGE_PUT &&
-                     operation != ESDB_CHANGE_DELETE) ||
-                    (operation == ESDB_CHANGE_DELETE &&
-                     value_type != ESDB_VALUE_NULL)) {
-                    return fail(
-                        database, error, ESDB_ERR_CORRUPT,
-                        ESDB_PHASE_SUBSCRIPTION,
-                        database->handle, SQLITE_CORRUPT,
-                        "invalid change journal row");
-                }
-
+            for (const MemoryChange &change : state->changes) {
+                if (change.revision <= after_revision) continue;
+                if (snapshot.size() >= limit) break;
                 OwnedChange owned;
-                owned.revision = static_cast<std::uint64_t>(raw_revision);
-                owned.operation = operation;
-                owned.value_type = value_type;
-                owned.store_name.assign(store_name);
-                owned.key.assign(key);
+                owned.revision = change.revision;
+                owned.operation = change.operation;
+                owned.value_type = change.value_type;
+                owned.key = change.key;
                 snapshot.emplace_back(std::move(owned));
             }
         }
     } catch (const std::bad_alloc &) {
-        return fail(
-            database, error, ESDB_ERR_OUT_OF_MEMORY,
-            ESDB_PHASE_SUBSCRIPTION,
-            database->handle, SQLITE_NOMEM,
-            "failed to allocate change snapshot");
+        return store_fail(
+            error, ESDB_ERR_OUT_OF_MEMORY, ESDB_PHASE_SUBSCRIPTION,
+            "failed to allocate Store change snapshot");
     } catch (...) {
-        return fail(
-            database, error, ESDB_ERR_INTERNAL,
-            ESDB_PHASE_SUBSCRIPTION,
-            database->handle, SQLITE_ERROR,
-            "unexpected exception while building change snapshot");
+        return store_fail(
+            error, ESDB_ERR_INTERNAL, ESDB_PHASE_SUBSCRIPTION,
+            "unexpected exception while snapshotting Store changes");
     }
 
     std::uint64_t last = after_revision;
     std::uint32_t delivered = 0u;
     for (const OwnedChange &owned : snapshot) {
-        esdb_change change{};
+        esdb_store_change change{};
         change.revision = owned.revision;
         change.operation = owned.operation;
         change.value_type = owned.value_type;
-        change.store_name = owned.store_name.c_str();
-        change.key = owned.key.c_str();
+        change.key =
+            owned.operation == ESDB_STORE_CHANGE_CLEAR
+                ? nullptr
+                : owned.key.c_str();
 
         last = change.revision;
         ++delivered;
         try {
             if (callback(&change, user_data) != 0) break;
         } catch (...) {
-            return fail(
-                database, error, ESDB_ERR_INTERNAL,
-                ESDB_PHASE_SUBSCRIPTION,
-                database->handle, SQLITE_ABORT,
-                "change callback threw an exception");
+            return store_fail(
+                error, ESDB_ERR_INTERNAL, ESDB_PHASE_SUBSCRIPTION,
+                "Store change callback threw an exception");
         }
     }
 
@@ -868,497 +254,539 @@ esdb_status store_changes_since_impl(
     return ESDB_OK;
 }
 
-}  // namespace esdb_detail
+}  // namespace
 
-esdb_status esdb_store_ensure(
-    esdb_database *database,
-    const char *store_name_utf8,
+esdb_status esdb_store_open(
+    const char *name_utf8,
+    esdb_store **out_store,
     esdb_error *error) {
-    esdb_detail::count_operation(database);
     esdb_detail::clear_error(error);
-    if (!database || !database->handle ||
-        !esdb_detail::valid_store_name(store_name_utf8)) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
-            database ? database->handle : nullptr, SQLITE_MISMATCH,
-            "invalid store ensure arguments");
+    if (out_store) *out_store = nullptr;
+    if (!out_store || !valid_name(name_utf8)) {
+        return store_fail(
+            error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
+            "Store name and out_store are required");
     }
 
-    std::lock_guard<esdb_detail::NoThrowMutex> write_lock(
-        database->store_write_mutex);
-    esdb_status status = esdb_detail::ensure_store_schema(database, error);
-    if (status != ESDB_OK) return status;
+    try {
+        std::shared_ptr<MemoryStoreState> state;
+        {
+            std::lock_guard<esdb_detail::NoThrowMutex> lock(registry_mutex());
+            auto &stores = registry();
+            const auto found = stores.find(name_utf8);
+            if (found != stores.end()) {
+                state = found->second;
+            } else {
+                state = std::make_shared<MemoryStoreState>(std::string(name_utf8));
+                stores.emplace(state->name, state);
+            }
+            state->handle_count.fetch_add(1u, std::memory_order_relaxed);
+        }
 
-    sqlite3_int64 id = 0;
-    status = get_store_id(
-        database, store_name_utf8, &id, false, error);
-    if (status == ESDB_OK) return ESDB_OK;
-    if (status != ESDB_ERR_NOT_FOUND) return status;
+        esdb_store *handle = new (std::nothrow) esdb_store();
+        if (!handle) {
+            state->handle_count.fetch_sub(1u, std::memory_order_relaxed);
+            return store_fail(
+                error, ESDB_ERR_OUT_OF_MEMORY, ESDB_PHASE_STORE,
+                "failed to allocate Store handle");
+        }
+        handle->state = std::move(state);
+        *out_store = handle;
+        return ESDB_OK;
+    } catch (const std::bad_alloc &) {
+        return store_fail(
+            error, ESDB_ERR_OUT_OF_MEMORY, ESDB_PHASE_STORE,
+            "failed to allocate named Store");
+    } catch (...) {
+        return store_fail(
+            error, ESDB_ERR_INTERNAL, ESDB_PHASE_STORE,
+            "unexpected exception while opening Store");
+    }
+}
 
-    status = require_store_writable(database, error);
-    if (status != ESDB_OK) return status;
-    return get_store_id(
-        database, store_name_utf8, &id, true, error);
+void esdb_store_close(esdb_store *store) {
+    if (!store) return;
+    if (store->state) {
+        store->state->handle_count.fetch_sub(1u, std::memory_order_relaxed);
+    }
+    delete store;
+}
+
+esdb_status esdb_store_destroy(
+    const char *name_utf8,
+    esdb_error *error) {
+    esdb_detail::clear_error(error);
+    if (!valid_name(name_utf8)) {
+        return store_fail(
+            error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
+            "valid Store name is required");
+    }
+
+    std::lock_guard<esdb_detail::NoThrowMutex> lock(registry_mutex());
+    auto &stores = registry();
+    const auto found = stores.find(name_utf8);
+    if (found == stores.end()) {
+        return store_fail(
+            error, ESDB_ERR_NOT_FOUND, ESDB_PHASE_STORE,
+            "named Store does not exist");
+    }
+
+    const std::shared_ptr<MemoryStoreState> &state = found->second;
+    if (state->handle_count.load(std::memory_order_relaxed) != 0u ||
+        state->subscription_count.load(std::memory_order_relaxed) != 0u) {
+        return store_fail(
+            error, ESDB_ERR_BUSY, ESDB_PHASE_STORE,
+            "named Store still has active handles or subscriptions");
+    }
+    stores.erase(found);
+    return ESDB_OK;
+}
+
+const char *esdb_store_name(const esdb_store *store) {
+    return store && store->state ? store->state->name.c_str() : nullptr;
 }
 
 esdb_status esdb_store_put(
-    esdb_database *database,
-    const char *store_name_utf8,
+    esdb_store *store,
     const char *key_utf8,
     const esdb_value *value,
-    uint64_t *out_revision,
+    std::uint64_t *out_revision,
     esdb_error *error) {
-    esdb_detail::count_operation(database);
     esdb_detail::clear_error(error);
     if (out_revision) *out_revision = 0u;
-
-    if (!database || !database->handle ||
-        !esdb_detail::valid_store_name(store_name_utf8) ||
-        !esdb_detail::valid_store_key(key_utf8) ||
-        !value ||
-        !valid_value_type(static_cast<int>(value->type))) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
-            database ? database->handle : nullptr, SQLITE_MISUSE,
-            "invalid store put arguments");
+    if (validate_store(store, error, ESDB_PHASE_STORE) != ESDB_OK ||
+        !valid_key(key_utf8) || !value || !valid_value_type(value->type)) {
+        return store_fail(
+            error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
+            "invalid Store put arguments");
     }
 
-    std::lock_guard<esdb_detail::NoThrowMutex> write_lock(
-        database->store_write_mutex);
+    try {
+        std::string map_key(key_utf8);
+        MemoryRecord candidate;
+        candidate.value.type = value->type;
+        candidate.value.payload = value->payload;
 
-    esdb_status status =
-        esdb_detail::ensure_store_schema(database, error);
-    if (status != ESDB_OK) return status;
-    status = require_store_writable(database, error);
-    if (status != ESDB_OK) return status;
+        MemoryChange change;
+        change.operation = ESDB_STORE_CHANGE_PUT;
+        change.value_type = value->type;
+        change.key.assign(key_utf8);
 
-    StoreMutationScope mutation{};
-    status = begin_store_mutation(database, &mutation, error);
-    if (status != ESDB_OK) return status;
+        std::shared_ptr<MemoryStoreState> state = store->state;
+        std::lock_guard<esdb_detail::NoThrowMutex> lock(state->mutex);
+        if (state->revision >= ESDB_REVISION_MAX) {
+            return store_fail(
+                error, ESDB_ERR_INVALID_STATE, ESDB_PHASE_STORE,
+                "Store revision domain is exhausted");
+        }
 
-    sqlite3_int64 store_id = 0;
-    status = get_store_id(
-        database, store_name_utf8, &store_id, true, error);
-    if (status != ESDB_OK) {
-        rollback_store_mutation(database, &mutation);
-        return status;
-    }
+        const std::uint64_t revision = state->revision + 1u;
+        candidate.revision = revision;
+        change.revision = revision;
 
-    sqlite3_int64 revision = 0;
-    status = insert_change(
-        database,
-        store_id,
-        key_utf8,
-        ESDB_CHANGE_PUT,
-        value->type,
-        esdb_detail::unix_time_ms(),
-        &revision,
-        error);
-    if (status != ESDB_OK) {
-        rollback_store_mutation(database, &mutation);
-        return status;
-    }
-
-    esdb_detail::Statement record;
-    status = record.prepare(
-        database,
-        "INSERT INTO __esdb_records("
-        "store_id,key,type,value,revision,created_at_ms,updated_at_ms"
-        ") VALUES(?1,?2,?3,?4,?5,?6,?6) "
-        "ON CONFLICT(store_id,key) DO UPDATE SET "
-        "type=excluded.type,"
-        "value=excluded.value,"
-        "revision=excluded.revision,"
-        "updated_at_ms=excluded.updated_at_ms;",
-        ESDB_PHASE_STORE,
-        error);
-    if (status != ESDB_OK) {
-        rollback_store_mutation(database, &mutation);
-        return status;
-    }
-
-    const sqlite3_int64 now = esdb_detail::unix_time_ms();
-    status = record.bind_int64(
-        database, 1, store_id, ESDB_PHASE_STORE, error);
-    if (status == ESDB_OK) {
-        status = record.bind_text(
-            database, 2, key_utf8, -1, ESDB_PHASE_STORE, error);
-    }
-    if (status == ESDB_OK) {
-        status = record.bind_int(
-            database, 3, static_cast<int>(value->type),
-            ESDB_PHASE_STORE, error);
-    }
-    if (status == ESDB_OK) {
-        if (value->payload.empty()) {
-            status = record.bind_zeroblob(
-                database, 4, 0, ESDB_PHASE_STORE, error);
+        /*
+         * Preserve the strong mutation guarantee even under allocation
+         * failure: stage the record mutation first, then publish the change
+         * event. If the deque allocation fails, restore the previous record
+         * without allocating. retain_change() only prunes history after its
+         * append has succeeded.
+         */
+        auto existing = state->records.find(map_key);
+        bool inserted = false;
+        MemoryRecord previous;
+        if (existing != state->records.end()) {
+            previous = std::move(existing->second);
+            existing->second = std::move(candidate);
         } else {
-            status = record.bind_blob64(
-                database, 4, value->payload.data(),
-                static_cast<std::uint64_t>(value->payload.size()),
-                ESDB_PHASE_STORE, error);
+            auto inserted_result =
+                state->records.emplace(map_key, std::move(candidate));
+            existing = inserted_result.first;
+            inserted = inserted_result.second;
+        }
+
+        try {
+            retain_change(*state, std::move(change));
+        } catch (...) {
+            if (inserted) {
+                state->records.erase(existing);
+            } else {
+                existing->second = std::move(previous);
+            }
+            throw;
+        }
+
+        state->revision = revision;
+        if (out_revision) *out_revision = revision;
+        return ESDB_OK;
+    } catch (const std::bad_alloc &) {
+        return store_fail(
+            error, ESDB_ERR_OUT_OF_MEMORY, ESDB_PHASE_STORE,
+            "failed to allocate Store mutation");
+    } catch (...) {
+        return store_fail(
+            error, ESDB_ERR_INTERNAL, ESDB_PHASE_STORE,
+            "unexpected exception during Store put");
+    }
+}
+
+esdb_status esdb_store_patch(
+    esdb_store *store,
+    const esdb_store_patch_entry *entries,
+    std::uint32_t count,
+    std::uint64_t *out_revision,
+    esdb_error *error) {
+    esdb_detail::clear_error(error);
+    if (out_revision) *out_revision = 0u;
+    if (validate_store(store, error, ESDB_PHASE_STORE) != ESDB_OK ||
+        (count != 0u && !entries) ||
+        count > ESDB_STORE_PATCH_MAX_ENTRIES) {
+        return store_fail(
+            error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
+            "invalid Store patch arguments");
+    }
+
+    for (std::uint32_t i = 0u; i < count; ++i) {
+        if (!valid_key(entries[i].key) ||
+            !entries[i].value ||
+            !valid_value_type(entries[i].value->type)) {
+            return store_fail(
+                error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
+                "Store patch contains an invalid key or value");
         }
     }
-    if (status == ESDB_OK) {
-        status = record.bind_int64(
-            database, 5, revision, ESDB_PHASE_STORE, error);
+
+    std::shared_ptr<MemoryStoreState> state = store->state;
+    std::lock_guard<esdb_detail::NoThrowMutex> lock(state->mutex);
+
+    if (count == 0u) {
+        if (out_revision) *out_revision = state->revision;
+        return ESDB_OK;
     }
-    if (status == ESDB_OK) {
-        status = record.bind_int64(
-            database, 6, now, ESDB_PHASE_STORE, error);
-    }
-    if (status != ESDB_OK) {
-        rollback_store_mutation(database, &mutation);
-        return status;
+    if (state->revision > ESDB_REVISION_MAX - count) {
+        return store_fail(
+            error, ESDB_ERR_INVALID_STATE, ESDB_PHASE_STORE,
+            "Store revision domain is exhausted");
     }
 
-    int step = 0;
-    status = record.step(database, &step, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK || step != SQLITE_DONE) {
-        if (status == ESDB_OK) {
-            status = esdb_detail::fail(
-                database, error, ESDB_ERR_SQLITE, ESDB_PHASE_STORE,
-                database->handle, SQLITE_ERROR,
-                "record upsert did not finish");
+    /*
+     * Copy-on-write is deliberate here: single-key put() stays on the fast
+     * path, while multi-key patch() pays O(n) copying to guarantee failure
+     * atomicity even under allocator failure. Nothing in the live Store is
+     * changed until both the candidate records and change journal are complete.
+     */
+    try {
+        auto candidate_records = state->records;
+        auto candidate_changes = state->changes;
+        std::uint64_t revision = state->revision;
+        std::uint64_t candidate_floor = state->retained_floor;
+
+        for (std::uint32_t i = 0u; i < count; ++i) {
+            ++revision;
+
+            MemoryRecord record;
+            record.value.type = entries[i].value->type;
+            record.value.payload = entries[i].value->payload;
+            record.revision = revision;
+            candidate_records[entries[i].key] = std::move(record);
+
+            MemoryChange change;
+            change.revision = revision;
+            change.operation = ESDB_STORE_CHANGE_PUT;
+            change.value_type = entries[i].value->type;
+            change.key.assign(entries[i].key);
+            candidate_changes.emplace_back(std::move(change));
+
+            while (candidate_changes.size() > ESDB_STORE_CHANGE_CAPACITY) {
+                candidate_floor = candidate_changes.front().revision;
+                candidate_changes.pop_front();
+            }
         }
-        rollback_store_mutation(database, &mutation);
-        return status;
-    }
 
-    status = set_store_revision(database, revision, error);
-    if (status != ESDB_OK) {
-        rollback_store_mutation(database, &mutation);
-        return status;
+        state->records.swap(candidate_records);
+        state->changes.swap(candidate_changes);
+        state->retained_floor = candidate_floor;
+        state->revision = revision;
+        if (out_revision) *out_revision = revision;
+        return ESDB_OK;
+    } catch (const std::bad_alloc &) {
+        return store_fail(
+            error, ESDB_ERR_OUT_OF_MEMORY, ESDB_PHASE_STORE,
+            "failed to allocate atomic Store patch");
+    } catch (...) {
+        return store_fail(
+            error, ESDB_ERR_INTERNAL, ESDB_PHASE_STORE,
+            "unexpected exception during Store patch");
     }
-
-    status = commit_store_mutation(database, &mutation, error);
-    if (status != ESDB_OK) return status;
-
-    if (out_revision) {
-        *out_revision = static_cast<std::uint64_t>(revision);
-    }
-    return ESDB_OK;
 }
 
 esdb_status esdb_store_get(
-    esdb_database *database,
-    const char *store_name_utf8,
+    esdb_store *store,
     const char *key_utf8,
     esdb_value **out_value,
     esdb_error *error) {
-    esdb_detail::count_operation(database);
     esdb_detail::clear_error(error);
     if (out_value) *out_value = nullptr;
-
-    if (!database || !database->handle || !out_value ||
-        !esdb_detail::valid_store_name(store_name_utf8) ||
-        !esdb_detail::valid_store_key(key_utf8)) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
-            database ? database->handle : nullptr, SQLITE_MISUSE,
-            "invalid store get arguments");
+    if (validate_store(store, error, ESDB_PHASE_STORE) != ESDB_OK ||
+        !out_value || !valid_key(key_utf8)) {
+        return store_fail(
+            error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
+            "invalid Store get arguments");
     }
 
-    std::lock_guard<esdb_detail::NoThrowMutex> store_lock(
-        database->store_write_mutex);
-    esdb_status status =
-        esdb_detail::ensure_store_schema(database, error);
-    if (status != ESDB_OK) return status;
-
-    esdb_detail::Statement statement;
-    status = statement.prepare(
-        database,
-        "SELECT r.type,r.value "
-        "FROM __esdb_records r "
-        "JOIN __esdb_stores s ON s.id=r.store_id "
-        "WHERE s.name=?1 AND r.key=?2;",
-        ESDB_PHASE_STORE,
-        error);
-    if (status != ESDB_OK) return status;
-    status = statement.bind_text(
-        database, 1, store_name_utf8, -1, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-    status = statement.bind_text(
-        database, 2, key_utf8, -1, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-
-    int step = 0;
-    status = statement.step(database, &step, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-    if (step == SQLITE_DONE) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_NOT_FOUND, ESDB_PHASE_STORE,
-            database->handle, SQLITE_NOTFOUND,
-            "store key was not found");
+    std::lock_guard<esdb_detail::NoThrowMutex> lock(store->state->mutex);
+    const auto found = store->state->records.find(key_utf8);
+    if (found == store->state->records.end()) {
+        return ESDB_ERR_NOT_FOUND;
     }
-
-    return clone_sql_value(
-        statement.get(), 0, 1, out_value, database, error);
+    return clone_value(
+        &found->second.value, out_value, error, ESDB_PHASE_STORE);
 }
 
 esdb_status esdb_store_delete(
-    esdb_database *database,
-    const char *store_name_utf8,
+    esdb_store *store,
     const char *key_utf8,
     int *out_deleted,
-    uint64_t *out_revision,
+    std::uint64_t *out_revision,
     esdb_error *error) {
-    esdb_detail::count_operation(database);
     esdb_detail::clear_error(error);
     if (out_deleted) *out_deleted = 0;
     if (out_revision) *out_revision = 0u;
-
-    if (!database || !database->handle ||
-        !esdb_detail::valid_store_name(store_name_utf8) ||
-        !esdb_detail::valid_store_key(key_utf8)) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
-            database ? database->handle : nullptr, SQLITE_MISUSE,
-            "invalid store delete arguments");
+    if (validate_store(store, error, ESDB_PHASE_STORE) != ESDB_OK ||
+        !valid_key(key_utf8)) {
+        return store_fail(
+            error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
+            "invalid Store delete arguments");
     }
 
-    std::lock_guard<esdb_detail::NoThrowMutex> write_lock(
-        database->store_write_mutex);
+    try {
+        MemoryChange change;
+        change.operation = ESDB_STORE_CHANGE_DELETE;
+        change.value_type = ESDB_VALUE_NULL;
+        change.key.assign(key_utf8);
 
-    esdb_status status =
-        esdb_detail::ensure_store_schema(database, error);
-    if (status != ESDB_OK) return status;
-
-    sqlite3_int64 store_id = 0;
-    status = get_store_id(
-        database, store_name_utf8, &store_id, false, error);
-    if (status == ESDB_ERR_NOT_FOUND) return ESDB_OK;
-    if (status != ESDB_OK) return status;
-    status = require_store_writable(database, error);
-    if (status != ESDB_OK) return status;
-
-    StoreMutationScope mutation{};
-    status = begin_store_mutation(database, &mutation, error);
-    if (status != ESDB_OK) return status;
-
-    esdb_detail::Statement remove;
-    status = remove.prepare(
-        database,
-        "DELETE FROM __esdb_records "
-        "WHERE store_id=?1 AND key=?2 RETURNING 1;",
-        ESDB_PHASE_STORE,
-        error);
-    if (status == ESDB_OK) {
-        status = remove.bind_int64(
-            database, 1, store_id, ESDB_PHASE_STORE, error);
-    }
-    if (status == ESDB_OK) {
-        status = remove.bind_text(
-            database, 2, key_utf8, -1, ESDB_PHASE_STORE, error);
-    }
-    if (status != ESDB_OK) {
-        rollback_store_mutation(database, &mutation);
-        return status;
-    }
-
-    int step = 0;
-    status = remove.step(database, &step, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) {
-        rollback_store_mutation(database, &mutation);
-        return status;
-    }
-
-    const bool deleted = step == SQLITE_ROW;
-    if (deleted) {
-        status = remove.step(database, &step, ESDB_PHASE_STORE, error);
-        if (status != ESDB_OK || step != SQLITE_DONE) {
-            if (status == ESDB_OK) {
-                status = esdb_detail::fail(
-                    database, error, ESDB_ERR_SQLITE, ESDB_PHASE_STORE,
-                    database->handle, SQLITE_ERROR,
-                    "record delete did not finish");
-            }
-            rollback_store_mutation(database, &mutation);
-            return status;
+        std::shared_ptr<MemoryStoreState> state = store->state;
+        std::lock_guard<esdb_detail::NoThrowMutex> lock(state->mutex);
+        const auto found = state->records.find(key_utf8);
+        if (found == state->records.end()) {
+            if (out_revision) *out_revision = state->revision;
+            return ESDB_OK;
         }
-    }
+        if (state->revision >= ESDB_REVISION_MAX) {
+            return store_fail(
+                error, ESDB_ERR_INVALID_STATE, ESDB_PHASE_STORE,
+                "Store revision domain is exhausted");
+        }
 
-    if (!deleted) {
-        return commit_store_mutation(database, &mutation, error);
-    }
+        const std::uint64_t revision = state->revision + 1u;
+        change.revision = revision;
+        retain_change(*state, std::move(change));
+        state->records.erase(found);
+        state->revision = revision;
 
-    sqlite3_int64 revision = 0;
-    status = insert_change(
-        database,
-        store_id,
-        key_utf8,
-        ESDB_CHANGE_DELETE,
-        ESDB_VALUE_NULL,
-        esdb_detail::unix_time_ms(),
-        &revision,
-        error);
-    if (status != ESDB_OK) {
-        rollback_store_mutation(database, &mutation);
-        return status;
+        if (out_deleted) *out_deleted = 1;
+        if (out_revision) *out_revision = revision;
+        return ESDB_OK;
+    } catch (const std::bad_alloc &) {
+        return store_fail(
+            error, ESDB_ERR_OUT_OF_MEMORY, ESDB_PHASE_STORE,
+            "failed to allocate Store delete change");
+    } catch (...) {
+        return store_fail(
+            error, ESDB_ERR_INTERNAL, ESDB_PHASE_STORE,
+            "unexpected exception during Store delete");
     }
-
-    status = set_store_revision(database, revision, error);
-    if (status != ESDB_OK) {
-        rollback_store_mutation(database, &mutation);
-        return status;
-    }
-
-    status = commit_store_mutation(database, &mutation, error);
-    if (status != ESDB_OK) return status;
-
-    if (out_deleted) *out_deleted = 1;
-    if (out_revision) {
-        *out_revision = static_cast<std::uint64_t>(revision);
-    }
-    return ESDB_OK;
 }
 
 esdb_status esdb_store_exists(
-    esdb_database *database,
-    const char *store_name_utf8,
+    esdb_store *store,
     const char *key_utf8,
     int *out_exists,
     esdb_error *error) {
-    esdb_detail::count_operation(database);
     esdb_detail::clear_error(error);
     if (out_exists) *out_exists = 0;
-
-    if (!database || !database->handle || !out_exists ||
-        !esdb_detail::valid_store_name(store_name_utf8) ||
-        !esdb_detail::valid_store_key(key_utf8)) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
-            database ? database->handle : nullptr, SQLITE_MISUSE,
-            "invalid store exists arguments");
+    if (validate_store(store, error, ESDB_PHASE_STORE) != ESDB_OK ||
+        !out_exists || !valid_key(key_utf8)) {
+        return store_fail(
+            error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
+            "invalid Store exists arguments");
     }
 
-    std::lock_guard<esdb_detail::NoThrowMutex> store_lock(
-        database->store_write_mutex);
-    esdb_status status =
-        esdb_detail::ensure_store_schema(database, error);
-    if (status != ESDB_OK) return status;
-
-    esdb_detail::Statement statement;
-    status = statement.prepare(
-        database,
-        "SELECT 1 "
-        "FROM __esdb_records r "
-        "JOIN __esdb_stores s ON s.id=r.store_id "
-        "WHERE s.name=?1 AND r.key=?2 LIMIT 1;",
-        ESDB_PHASE_STORE,
-        error);
-    if (status != ESDB_OK) return status;
-    status = statement.bind_text(
-        database, 1, store_name_utf8, -1, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-    status = statement.bind_text(
-        database, 2, key_utf8, -1, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-
-    int step = 0;
-    status = statement.step(database, &step, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-    *out_exists = step == SQLITE_ROW ? 1 : 0;
+    std::lock_guard<esdb_detail::NoThrowMutex> lock(store->state->mutex);
+    *out_exists = store->state->records.find(key_utf8) !=
+            store->state->records.end()
+        ? 1
+        : 0;
     return ESDB_OK;
 }
 
 esdb_status esdb_store_count(
-    esdb_database *database,
-    const char *store_name_utf8,
-    uint64_t *out_count,
+    esdb_store *store,
+    std::uint64_t *out_count,
     esdb_error *error) {
-    esdb_detail::count_operation(database);
     esdb_detail::clear_error(error);
     if (out_count) *out_count = 0u;
-
-    if (!database || !database->handle || !out_count ||
-        !esdb_detail::valid_store_name(store_name_utf8)) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
-            database ? database->handle : nullptr, SQLITE_MISUSE,
-            "invalid store count arguments");
+    if (validate_store(store, error, ESDB_PHASE_STORE) != ESDB_OK ||
+        !out_count) {
+        return store_fail(
+            error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
+            "Store and out_count are required");
     }
 
-    std::lock_guard<esdb_detail::NoThrowMutex> store_lock(
-        database->store_write_mutex);
-    esdb_status status =
-        esdb_detail::ensure_store_schema(database, error);
-    if (status != ESDB_OK) return status;
+    std::lock_guard<esdb_detail::NoThrowMutex> lock(store->state->mutex);
+    *out_count = static_cast<std::uint64_t>(store->state->records.size());
+    return ESDB_OK;
+}
 
-    esdb_detail::Statement statement;
-    status = statement.prepare(
-        database,
-        "SELECT COUNT(*) "
-        "FROM __esdb_records r "
-        "JOIN __esdb_stores s ON s.id=r.store_id "
-        "WHERE s.name=?1;",
-        ESDB_PHASE_STORE,
-        error);
-    if (status != ESDB_OK) return status;
-    status = statement.bind_text(
-        database, 1, store_name_utf8, -1, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-
-    int step = 0;
-    status = statement.step(database, &step, ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-    if (step != SQLITE_ROW) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_SQLITE, ESDB_PHASE_STORE,
-            database->handle, SQLITE_ERROR,
-            "store count returned no row");
+esdb_status esdb_store_clear(
+    esdb_store *store,
+    int *out_cleared,
+    std::uint64_t *out_revision,
+    esdb_error *error) {
+    esdb_detail::clear_error(error);
+    if (out_cleared) *out_cleared = 0;
+    if (out_revision) *out_revision = 0u;
+    if (validate_store(store, error, ESDB_PHASE_STORE) != ESDB_OK) {
+        return ESDB_ERR_INVALID_ARGUMENT;
     }
 
-    const sqlite3_int64 count = sqlite3_column_int64(statement.get(), 0);
-    if (count < 0) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_CORRUPT, ESDB_PHASE_STORE,
-            database->handle, SQLITE_CORRUPT,
-            "store count is negative");
+    try {
+        MemoryChange change;
+        change.operation = ESDB_STORE_CHANGE_CLEAR;
+        change.value_type = ESDB_VALUE_NULL;
+
+        std::shared_ptr<MemoryStoreState> state = store->state;
+        std::lock_guard<esdb_detail::NoThrowMutex> lock(state->mutex);
+        if (state->records.empty()) {
+            if (out_revision) *out_revision = state->revision;
+            return ESDB_OK;
+        }
+        if (state->revision >= ESDB_REVISION_MAX) {
+            return store_fail(
+                error, ESDB_ERR_INVALID_STATE, ESDB_PHASE_STORE,
+                "Store revision domain is exhausted");
+        }
+
+        const std::uint64_t revision = state->revision + 1u;
+        change.revision = revision;
+        retain_change(*state, std::move(change));
+        state->records.clear();
+        state->revision = revision;
+
+        if (out_cleared) *out_cleared = 1;
+        if (out_revision) *out_revision = revision;
+        return ESDB_OK;
+    } catch (const std::bad_alloc &) {
+        return store_fail(
+            error, ESDB_ERR_OUT_OF_MEMORY, ESDB_PHASE_STORE,
+            "failed to allocate Store clear change");
+    } catch (...) {
+        return store_fail(
+            error, ESDB_ERR_INTERNAL, ESDB_PHASE_STORE,
+            "unexpected exception during Store clear");
     }
-    *out_count = static_cast<std::uint64_t>(count);
+}
+
+esdb_status esdb_store_scan(
+    esdb_store *store,
+    const char *after_key_or_null_utf8,
+    std::uint32_t limit,
+    esdb_store_record_callback callback,
+    void *user_data,
+    std::uint32_t *out_record_count,
+    esdb_error *error) {
+    esdb_detail::clear_error(error);
+    if (out_record_count) *out_record_count = 0u;
+    if (validate_store(store, error, ESDB_PHASE_STORE) != ESDB_OK ||
+        !callback ||
+        (after_key_or_null_utf8 && !valid_key(after_key_or_null_utf8)) ||
+        limit > ESDB_STORE_SCAN_LIMIT_MAX) {
+        return store_fail(
+            error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
+            "invalid Store scan arguments");
+    }
+    if (limit == 0u) limit = ESDB_STORE_SCAN_LIMIT_MAX;
+
+    std::vector<OwnedRecord> snapshot;
+    try {
+        snapshot.reserve(limit < 256u ? limit : 256u);
+        {
+            std::lock_guard<esdb_detail::NoThrowMutex> lock(store->state->mutex);
+            auto current = after_key_or_null_utf8
+                ? store->state->records.upper_bound(after_key_or_null_utf8)
+                : store->state->records.begin();
+            for (; current != store->state->records.end() &&
+                   snapshot.size() < limit;
+                 ++current) {
+                OwnedRecord owned;
+                owned.key = current->first;
+                owned.value.type = current->second.value.type;
+                owned.value.payload = current->second.value.payload;
+                owned.revision = current->second.revision;
+                snapshot.emplace_back(std::move(owned));
+            }
+        }
+    } catch (const std::bad_alloc &) {
+        return store_fail(
+            error, ESDB_ERR_OUT_OF_MEMORY, ESDB_PHASE_STORE,
+            "failed to allocate Store scan snapshot");
+    } catch (...) {
+        return store_fail(
+            error, ESDB_ERR_INTERNAL, ESDB_PHASE_STORE,
+            "unexpected exception while snapshotting Store");
+    }
+
+    std::uint32_t delivered = 0u;
+    for (OwnedRecord &owned : snapshot) {
+        esdb_store_record record{};
+        record.key = owned.key.c_str();
+        record.value = &owned.value;
+        record.revision = owned.revision;
+        ++delivered;
+        try {
+            if (callback(&record, user_data) != 0) break;
+        } catch (...) {
+            return store_fail(
+                error, ESDB_ERR_INTERNAL, ESDB_PHASE_STORE,
+                "Store scan callback threw an exception");
+        }
+    }
+
+    if (out_record_count) *out_record_count = delivered;
     return ESDB_OK;
 }
 
 esdb_status esdb_store_revision(
-    esdb_database *database,
-    uint64_t *out_revision,
+    esdb_store *store,
+    std::uint64_t *out_revision,
     esdb_error *error) {
-    esdb_detail::count_operation(database);
     esdb_detail::clear_error(error);
     if (out_revision) *out_revision = 0u;
-
-    if (!database || !database->handle || !out_revision) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
-            database ? database->handle : nullptr, SQLITE_MISUSE,
-            "database and out_revision are required");
+    if (validate_store(store, error, ESDB_PHASE_STORE) != ESDB_OK ||
+        !out_revision) {
+        return store_fail(
+            error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
+            "Store and out_revision are required");
     }
 
-    std::lock_guard<esdb_detail::NoThrowMutex> store_lock(
-        database->store_write_mutex);
-    esdb_status status =
-        esdb_detail::ensure_store_schema(database, error);
-    if (status != ESDB_OK) return status;
-
-    return read_store_revision_metadata(database, out_revision, error);
+    std::lock_guard<esdb_detail::NoThrowMutex> lock(store->state->mutex);
+    *out_revision = store->state->revision;
+    return ESDB_OK;
 }
 
 esdb_status esdb_store_changes_since(
-    esdb_database *database,
-    const char *store_name_or_null_utf8,
-    uint64_t after_revision,
-    uint32_t limit,
-    esdb_change_callback callback,
+    esdb_store *store,
+    std::uint64_t after_revision,
+    std::uint32_t limit,
+    esdb_store_change_callback callback,
     void *user_data,
-    uint64_t *out_last_revision,
-    uint32_t *out_change_count,
+    std::uint64_t *out_last_revision,
+    std::uint32_t *out_change_count,
     esdb_error *error) {
-    esdb_detail::count_operation(database);
-    return esdb_detail::store_changes_since_impl(
-        database,
-        store_name_or_null_utf8,
+    if (validate_store(store, error, ESDB_PHASE_SUBSCRIPTION) != ESDB_OK) {
+        return ESDB_ERR_INVALID_ARGUMENT;
+    }
+    return changes_since_impl(
+        store->state,
         after_revision,
         limit,
         callback,
@@ -1368,170 +796,103 @@ esdb_status esdb_store_changes_since(
         error);
 }
 
-esdb_status esdb_store_prune_changes(
-    esdb_database *database,
-    uint64_t through_revision,
-    uint64_t *out_deleted,
+esdb_status esdb_store_retained_floor(
+    esdb_store *store,
+    std::uint64_t *out_revision,
     esdb_error *error) {
-    esdb_detail::count_operation(database);
     esdb_detail::clear_error(error);
-    if (out_deleted) *out_deleted = 0u;
-
-    if (!database || !database->handle) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
-            database ? database->handle : nullptr, SQLITE_MISUSE,
-            "database is required");
+    if (out_revision) *out_revision = 0u;
+    if (validate_store(store, error, ESDB_PHASE_STORE) != ESDB_OK ||
+        !out_revision) {
+        return store_fail(
+            error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_STORE,
+            "Store and out_revision are required");
     }
-    if (through_revision > ESDB_REVISION_MAX) {
-        return invalid_revision(
-            database, error, ESDB_PHASE_STORE,
-            "through_revision exceeds the ESDB revision domain");
-    }
-
-    std::lock_guard<esdb_detail::NoThrowMutex> write_lock(
-        database->store_write_mutex);
-
-    esdb_status status =
-        esdb_detail::ensure_store_schema(database, error);
-    if (status != ESDB_OK) return status;
-    status = require_store_writable(database, error);
-    if (status != ESDB_OK) return status;
-
-    esdb_detail::Statement statement;
-    status = statement.prepare(
-        database,
-        "DELETE FROM __esdb_changes WHERE revision<=?1 RETURNING revision;",
-        ESDB_PHASE_STORE,
-        error);
-    if (status != ESDB_OK) return status;
-    status = statement.bind_int64(
-        database, 1, static_cast<sqlite3_int64>(through_revision),
-        ESDB_PHASE_STORE, error);
-    if (status != ESDB_OK) return status;
-
-    std::uint64_t deleted = 0u;
-    while (true) {
-        int step = 0;
-        status = statement.step(database, &step, ESDB_PHASE_STORE, error);
-        if (status != ESDB_OK) return status;
-        if (step == SQLITE_DONE) break;
-
-        const sqlite3_int64 revision =
-            sqlite3_column_int64(statement.get(), 0);
-        if (revision <= 0) {
-            return esdb_detail::fail(
-                database, error, ESDB_ERR_CORRUPT, ESDB_PHASE_STORE,
-                database->handle, SQLITE_CORRUPT,
-                "change prune returned an invalid revision");
-        }
-        ++deleted;
-    }
-
-    if (out_deleted) *out_deleted = deleted;
+    std::lock_guard<esdb_detail::NoThrowMutex> lock(store->state->mutex);
+    *out_revision = store->state->retained_floor;
     return ESDB_OK;
 }
 
-esdb_status esdb_subscribe(
-    esdb_database *database,
-    const char *store_name_or_null_utf8,
-    uint64_t after_revision,
-    esdb_subscription **out_subscription,
+esdb_status esdb_store_subscribe(
+    esdb_store *store,
+    std::uint64_t after_revision,
+    esdb_store_subscription **out_subscription,
     esdb_error *error) {
-    esdb_detail::count_operation(database);
     esdb_detail::clear_error(error);
     if (out_subscription) *out_subscription = nullptr;
-
-    if (!database || !database->handle || !out_subscription ||
-        (store_name_or_null_utf8 &&
-         !esdb_detail::valid_store_name(store_name_or_null_utf8))) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_INVALID_ARGUMENT,
-            ESDB_PHASE_SUBSCRIPTION,
-            database ? database->handle : nullptr, SQLITE_MISUSE,
-            "invalid subscription arguments");
-    }
-    if (after_revision > ESDB_REVISION_MAX) {
-        return invalid_revision(
-            database, error, ESDB_PHASE_SUBSCRIPTION,
-            "after_revision exceeds the ESDB revision domain");
+    if (validate_store(store, error, ESDB_PHASE_SUBSCRIPTION) != ESDB_OK ||
+        !out_subscription || after_revision > ESDB_REVISION_MAX) {
+        return store_fail(
+            error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_SUBSCRIPTION,
+            "invalid Store subscription arguments");
     }
 
-    esdb_status status =
-        esdb_detail::ensure_store_schema(database, error);
-    if (status != ESDB_OK) return status;
+    {
+        std::lock_guard<esdb_detail::NoThrowMutex> lock(store->state->mutex);
+        if (after_revision > store->state->revision) {
+            return store_fail(
+                error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_SUBSCRIPTION,
+                "subscription revision is newer than the Store");
+        }
+        if (after_revision < store->state->retained_floor) {
+            return store_fail(
+                error, ESDB_ERR_GAP, ESDB_PHASE_SUBSCRIPTION,
+                "subscription revision is older than retained Store history");
+        }
+    }
 
-    esdb_subscription *subscription =
-        new (std::nothrow) esdb_subscription();
+    esdb_store_subscription *subscription =
+        new (std::nothrow) esdb_store_subscription();
     if (!subscription) {
-        return esdb_detail::fail(
-            database, error, ESDB_ERR_OUT_OF_MEMORY,
-            ESDB_PHASE_SUBSCRIPTION,
-            database->handle, SQLITE_NOMEM,
-            "subscription allocation failed");
+        return store_fail(
+            error, ESDB_ERR_OUT_OF_MEMORY, ESDB_PHASE_SUBSCRIPTION,
+            "failed to allocate Store subscription");
     }
 
-    subscription->database = database;
-    subscription->all_stores = store_name_or_null_utf8 == nullptr;
+    subscription->state = store->state;
     subscription->revision.store(after_revision, std::memory_order_relaxed);
-    if (store_name_or_null_utf8) {
-        const std::size_t length = std::strlen(store_name_or_null_utf8);
-        std::memcpy(
-            subscription->store_name, store_name_or_null_utf8, length);
-        subscription->store_name[length] = '\0';
-    }
-
+    subscription->state->subscription_count.fetch_add(
+        1u, std::memory_order_relaxed);
     *out_subscription = subscription;
     return ESDB_OK;
 }
 
-esdb_status esdb_subscription_poll(
-    esdb_subscription *subscription,
-    uint32_t limit,
-    esdb_change_callback callback,
+esdb_status esdb_store_subscription_poll(
+    esdb_store_subscription *subscription,
+    std::uint32_t limit,
+    esdb_store_change_callback callback,
     void *user_data,
-    uint32_t *out_change_count,
+    std::uint32_t *out_change_count,
     esdb_error *error) {
+    esdb_detail::clear_error(error);
     if (out_change_count) *out_change_count = 0u;
-    if (!subscription || !subscription->database) {
-        esdb_detail::set_error(
-            error,
-            ESDB_ERR_INVALID_ARGUMENT,
-            ESDB_PHASE_SUBSCRIPTION,
-            nullptr,
-            SQLITE_MISUSE,
-            "subscription is required");
-        return ESDB_ERR_INVALID_ARGUMENT;
+    if (!subscription || !subscription->state || !callback) {
+        return store_fail(
+            error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_SUBSCRIPTION,
+            "invalid Store subscription poll arguments");
     }
 
-    esdb_detail::count_operation(subscription->database);
     std::unique_lock<esdb_detail::NoThrowMutex> poll_lock(
         subscription->poll_mutex, std::try_to_lock);
     if (!poll_lock.owns_lock()) {
-        return esdb_detail::fail(
-            subscription->database, error, ESDB_ERR_BUSY,
-            ESDB_PHASE_SUBSCRIPTION,
-            subscription->database->handle, SQLITE_BUSY,
-            "subscription is already being polled");
+        return store_fail(
+            error, ESDB_ERR_BUSY, ESDB_PHASE_SUBSCRIPTION,
+            "Store subscription is already being polled");
     }
-    const std::uint64_t start_revision =
-        subscription->revision.load(std::memory_order_relaxed);
-    std::uint64_t last = start_revision;
-    std::uint32_t count = 0u;
-    const char *filter =
-        subscription->all_stores ? nullptr : subscription->store_name;
 
-    const esdb_status status =
-        esdb_detail::store_changes_since_impl(
-            subscription->database,
-            filter,
-            start_revision,
-            limit,
-            callback,
-            user_data,
-            &last,
-            &count,
-            error);
+    const std::uint64_t start =
+        subscription->revision.load(std::memory_order_relaxed);
+    std::uint64_t last = start;
+    std::uint32_t count = 0u;
+    const esdb_status status = changes_since_impl(
+        subscription->state,
+        start,
+        limit,
+        callback,
+        user_data,
+        &last,
+        &count,
+        error);
     if (status == ESDB_OK) {
         subscription->revision.store(last, std::memory_order_relaxed);
     }
@@ -1539,13 +900,19 @@ esdb_status esdb_subscription_poll(
     return status;
 }
 
-uint64_t esdb_subscription_revision(
-    const esdb_subscription *subscription) {
+std::uint64_t esdb_store_subscription_revision(
+    const esdb_store_subscription *subscription) {
     return subscription
         ? subscription->revision.load(std::memory_order_relaxed)
         : 0u;
 }
 
-void esdb_subscription_destroy(esdb_subscription *subscription) {
+void esdb_store_subscription_destroy(
+    esdb_store_subscription *subscription) {
+    if (!subscription) return;
+    if (subscription->state) {
+        subscription->state->subscription_count.fetch_sub(
+            1u, std::memory_order_relaxed);
+    }
     delete subscription;
 }

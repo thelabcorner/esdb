@@ -28,13 +28,14 @@ extern "C" {
  * incremented when the layout of a public struct, the meaning of a public
  * enum value, or the signature of a public function changes.
  */
-#define ESDB_ABI_VERSION 1u
+#define ESDB_ABI_VERSION 2u
 
 #define ESDB_ERROR_MESSAGE_CAPACITY 256u
 #define ESDB_BACKEND_ID_CAPACITY 32u
 #define ESDB_BACKEND_VERSION_CAPACITY 32u
 #define ESDB_CODEC_ID_CAPACITY 32u
 #define ESDB_SAVEPOINT_NAME_MAX_BYTES 64u
+#define ESDB_REVISION_MAX UINT64_C(9223372036854775807)
 
 /*
  * Deterministic status model. Every public function returns one of these
@@ -62,7 +63,8 @@ enum {
     ESDB_ERR_UNSUPPORTED = 11u,
     ESDB_ERR_INVALID_STATE = 12u,
     ESDB_ERR_MIGRATION = 13u,
-    ESDB_ERR_INTERNAL = 14u
+    ESDB_ERR_INTERNAL = 14u,
+    ESDB_ERR_GAP = 15u
 };
 
 /* Operation phase, for diagnostics and deterministic error reporting. */
@@ -80,7 +82,8 @@ enum {
     ESDB_PHASE_VALUE = 9u,
     ESDB_PHASE_STORE = 10u,
     ESDB_PHASE_SUBSCRIPTION = 11u,
-    ESDB_PHASE_HEALTH = 12u
+    ESDB_PHASE_HEALTH = 12u,
+    ESDB_PHASE_OBJECT_STORE = 13u
 };
 
 typedef struct esdb_error {
@@ -113,7 +116,7 @@ _Static_assert(offsetof(esdb_error, message) == 16u, "esdb_error.message ABI off
 
 typedef struct esdb_database esdb_database;
 typedef struct esdb_transaction esdb_transaction;
-typedef struct esdb_subscription esdb_subscription;
+typedef struct esdb_object_subscription esdb_object_subscription;
 
 ESDB_API uint32_t esdb_abi_version(void);
 ESDB_API const char *esdb_version(void);

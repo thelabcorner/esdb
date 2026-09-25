@@ -10,7 +10,7 @@ The exact archive URL and cryptographic pin used by ESDB are recorded in `cmake/
 
 ## ESABI 0.3.1
 
-The optional ExternalObject adapter targets ESABI 0.3.1. Its remote fallback is pinned to the ESABI v0.3.1 release commit `65c9c3ce627a26a89d6bf90547678841df0cf981`.
+The optional ExternalObject adapter targets ESABI 0.3.1. Its remote fallback is pinned to immutable source commit `400fefa14c1c09c0e51555f8e834975bdddbdb1d`, matching the ESABI source identity used by the final Windows validation build.
 
 ESABI is licensed under the MIT License:
 

@@ -1,5 +1,5 @@
 #include <esdb/esdb.h>
-#include <esdb/esdb_store.h>
+#include <esdb/esdb_object_store.h>
 
 #include <algorithm>
 #include <atomic>
@@ -56,7 +56,7 @@ struct ChangeCount {
     uint64_t last = 0u;
 };
 
-static int count_change(const esdb_change *change, void *user) {
+static int count_change(const esdb_object_change *change, void *user) {
     auto *capture = static_cast<ChangeCount *>(user);
     CHECK(change != nullptr);
     ++capture->count;
@@ -64,18 +64,53 @@ static int count_change(const esdb_change *change, void *user) {
     return 0;
 }
 
-static int throwing_change(const esdb_change *, void *) {
+static int throwing_change(const esdb_object_change *, void *) {
     throw std::runtime_error("intentional callback fault");
 }
 
+struct ScanCapture {
+    esdb_database *database = nullptr;
+    std::vector<std::string> keys;
+    std::vector<int32_t> values;
+    std::vector<uint64_t> revisions;
+};
+
+static int capture_record(const esdb_object_record *record, void *user) {
+    auto *capture = static_cast<ScanCapture *>(user);
+    CHECK(record != nullptr);
+    CHECK(record && record->key != nullptr);
+    CHECK(record && record->value != nullptr);
+    if (!record || !record->key || !record->value) return 1;
+
+    int32_t value = 0;
+    CHECK(esdb_value_get_int32(record->value, &value) == ESDB_OK);
+    capture->keys.emplace_back(record->key);
+    capture->values.push_back(value);
+    capture->revisions.push_back(record->revision);
+
+    /* Scan callbacks execute after the Store mutex is released. */
+    if (capture->database) {
+        uint64_t count = 0u;
+        esdb_error nested_error{};
+        CHECK(esdb_object_store_count(
+            capture->database, "scan", &count, &nested_error) == ESDB_OK);
+        CHECK(count == 3u);
+    }
+    return 0;
+}
+
+static int throwing_record(const esdb_object_record *, void *) {
+    throw std::runtime_error("intentional Store scan callback fault");
+}
+
 struct ReentrantPoll {
-    esdb_subscription *subscription = nullptr;
+    esdb_object_subscription *subscription = nullptr;
     esdb_status nested_status = ESDB_OK;
     esdb_status nested_error_status = ESDB_OK;
     uint32_t callbacks = 0u;
 };
 
-static int reentrant_poll_change(const esdb_change *change, void *user) {
+static int reentrant_poll_change(const esdb_object_change *change, void *user) {
     auto *context = static_cast<ReentrantPoll *>(user);
     CHECK(change != nullptr);
     ++context->callbacks;
@@ -83,7 +118,7 @@ static int reentrant_poll_change(const esdb_change *change, void *user) {
     ChangeCount nested_changes{};
     uint32_t nested_delivered = 0u;
     esdb_error nested_error{};
-    context->nested_status = esdb_subscription_poll(
+    context->nested_status = esdb_object_subscription_poll(
         context->subscription, 1u, count_change, &nested_changes,
         &nested_delivered, &nested_error);
     context->nested_error_status = nested_error.status;
@@ -98,10 +133,10 @@ static void check_value_roundtrip(
     esdb_value_type expected,
     esdb_error *error) {
     uint64_t revision = 0u;
-    CHECK(esdb_store_put(db, "typed", key, value, &revision, error) == ESDB_OK);
+    CHECK(esdb_object_store_put(db, "typed", key, value, &revision, error) == ESDB_OK);
     CHECK(revision > 0u);
     esdb_value *loaded = nullptr;
-    CHECK(esdb_store_get(db, "typed", key, &loaded, error) == ESDB_OK);
+    CHECK(esdb_object_store_get(db, "typed", key, &loaded, error) == ESDB_OK);
     CHECK(loaded != nullptr);
     if (loaded) CHECK(esdb_value_type_of(loaded) == expected);
     esdb_value_destroy(loaded);
@@ -165,6 +200,31 @@ int main() {
           ESDB_ERR_INVALID_ARGUMENT);
     CHECK(invalid == nullptr);
 
+    /* Compression requests fail closed when no provider is compiled in. */
+    bad_options = options;
+    bad_options.storage_mode = ESDB_STORAGE_COMPRESSED;
+    bad_options.storage_provider = ESDB_PROVIDER_AUTO;
+    bad_options.compression_codec = ESDB_CODEC_ZSTD;
+    CHECK(esdb_open(path.c_str(), &bad_options, &invalid, &error) ==
+          ESDB_ERR_UNSUPPORTED);
+    CHECK(invalid == nullptr);
+    CHECK(error.phase == ESDB_PHASE_OPEN);
+
+    bad_options = options;
+    bad_options.storage_mode = ESDB_STORAGE_PLAIN;
+    bad_options.compression_codec = ESDB_CODEC_ZSTD;
+    CHECK(esdb_open(path.c_str(), &bad_options, &invalid, &error) ==
+          ESDB_ERR_INVALID_ARGUMENT);
+    CHECK(invalid == nullptr);
+
+    bad_options = options;
+    bad_options.storage_mode = ESDB_STORAGE_COMPRESSED;
+    bad_options.storage_provider = ESDB_PROVIDER_SQLITE;
+    bad_options.compression_codec = ESDB_CODEC_ZSTD;
+    CHECK(esdb_open(path.c_str(), &bad_options, &invalid, &error) ==
+          ESDB_ERR_INVALID_ARGUMENT);
+    CHECK(invalid == nullptr);
+
     bad_options = options;
     bad_options.journal_mode = ESDB_JOURNAL_MEMORY;
     CHECK(esdb_open(":memory:", &bad_options, &invalid, &error) ==
@@ -215,21 +275,38 @@ int main() {
     CHECK(health_before.busy_timeout_ms == 4321u);
     CHECK(health_before.configured_cache_kib == 2048);
     uint64_t ignored_count = 0u;
-    CHECK(esdb_store_count(db, "", &ignored_count, &error) == ESDB_ERR_INVALID_ARGUMENT);
+    CHECK(esdb_object_store_count(db, "", &ignored_count, &error) == ESDB_ERR_INVALID_ARGUMENT);
     esdb_database_health health_after{};
     health_after.struct_size = sizeof(health_after);
     CHECK(esdb_database_health_get(db, &health_after, &error) == ESDB_OK);
     CHECK(health_after.operation_count > health_before.operation_count);
     CHECK(health_after.error_count > health_before.error_count);
     CHECK(health_after.last_error_status == ESDB_ERR_INVALID_ARGUMENT);
-    CHECK(health_after.last_error_phase == ESDB_PHASE_STORE);
+    CHECK(health_after.last_error_phase == ESDB_PHASE_OBJECT_STORE);
+
+    /* A normal Store key miss is control flow, not a health failure. */
+    CHECK(esdb_object_store_ensure(db, "misses", &error) == ESDB_OK);
+    esdb_database_health miss_before{};
+    miss_before.struct_size = sizeof(miss_before);
+    CHECK(esdb_database_health_get(db, &miss_before, &error) == ESDB_OK);
+    esdb_value *missing_value = nullptr;
+    CHECK(esdb_object_store_get(
+        db, "misses", "absent", &missing_value, &error) == ESDB_ERR_NOT_FOUND);
+    CHECK(missing_value == nullptr);
+    CHECK(error.status == ESDB_OK);
+    esdb_database_health miss_after{};
+    miss_after.struct_size = sizeof(miss_after);
+    CHECK(esdb_database_health_get(db, &miss_after, &error) == ESDB_OK);
+    CHECK(miss_after.error_count == miss_before.error_count);
+    CHECK(miss_after.last_error_status == miss_before.last_error_status);
+    CHECK(miss_after.last_error_phase == miss_before.last_error_phase);
 
     /* Transaction + LIFO savepoint semantics. */
     esdb_transaction *tx = nullptr;
     CHECK(esdb_begin(db, ESDB_TRANSACTION_IMMEDIATE, &tx, &error) == ESDB_OK);
     esdb_value *one = nullptr;
     CHECK(esdb_value_create_int32(1, &one, &error) == ESDB_OK);
-    CHECK(esdb_store_put(db, "tx", "keep", one, nullptr, &error) == ESDB_OK);
+    CHECK(esdb_object_store_put(db, "tx", "keep", one, nullptr, &error) == ESDB_OK);
     CHECK(esdb_savepoint_begin(db, "__esdb_mutation", &error) ==
           ESDB_ERR_INVALID_ARGUMENT);
     CHECK(esdb_savepoint_begin(db, "__EsDb_Custom", &error) ==
@@ -237,16 +314,16 @@ int main() {
     CHECK(esdb_savepoint_depth(db) == 0u);
     CHECK(esdb_savepoint_begin(db, "sp1", &error) == ESDB_OK);
     CHECK(esdb_savepoint_depth(db) == 1u);
-    CHECK(esdb_store_put(db, "tx", "rollback", one, nullptr, &error) == ESDB_OK);
+    CHECK(esdb_object_store_put(db, "tx", "rollback", one, nullptr, &error) == ESDB_OK);
     CHECK(esdb_savepoint_rollback(db, "sp1", &error) == ESDB_OK);
     CHECK(esdb_savepoint_depth(db) == 0u);
     int exists = 0;
-    CHECK(esdb_store_exists(db, "tx", "rollback", &exists, &error) == ESDB_OK);
+    CHECK(esdb_object_store_exists(db, "tx", "rollback", &exists, &error) == ESDB_OK);
     CHECK(exists == 0);
     CHECK(esdb_commit(tx, &error) == ESDB_OK);
     esdb_transaction_destroy(tx);
     tx = nullptr;
-    CHECK(esdb_store_exists(db, "tx", "keep", &exists, &error) == ESDB_OK);
+    CHECK(esdb_object_store_exists(db, "tx", "keep", &exists, &error) == ESDB_OK);
     CHECK(exists == 1);
 
     /* Raw SQL transaction control keeps ESDB's transaction handle truthful. */
@@ -270,22 +347,22 @@ int main() {
 
     /* Store revisions and rows roll back with an outer transaction. */
     uint64_t before_outer_rollback = 0u;
-    CHECK(esdb_store_revision(db, &before_outer_rollback, &error) == ESDB_OK);
+    CHECK(esdb_object_store_revision(db, &before_outer_rollback, &error) == ESDB_OK);
     CHECK(esdb_begin(db, ESDB_TRANSACTION_IMMEDIATE, &tx, &error) == ESDB_OK);
     uint64_t provisional_revision = 0u;
-    CHECK(esdb_store_put(
+    CHECK(esdb_object_store_put(
         db, "tx", "outer-rollback", one, &provisional_revision, &error) == ESDB_OK);
     CHECK(provisional_revision > before_outer_rollback);
     uint64_t in_outer_revision = 0u;
-    CHECK(esdb_store_revision(db, &in_outer_revision, &error) == ESDB_OK);
+    CHECK(esdb_object_store_revision(db, &in_outer_revision, &error) == ESDB_OK);
     CHECK(in_outer_revision == provisional_revision);
     CHECK(esdb_rollback(tx, &error) == ESDB_OK);
     esdb_transaction_destroy(tx);
     tx = nullptr;
-    CHECK(esdb_store_exists(db, "tx", "outer-rollback", &exists, &error) == ESDB_OK);
+    CHECK(esdb_object_store_exists(db, "tx", "outer-rollback", &exists, &error) == ESDB_OK);
     CHECK(exists == 0);
     uint64_t after_outer_rollback = 0u;
-    CHECK(esdb_store_revision(db, &after_outer_rollback, &error) == ESDB_OK);
+    CHECK(esdb_object_store_revision(db, &after_outer_rollback, &error) == ESDB_OK);
     CHECK(after_outer_rollback == before_outer_rollback);
 
     esdb_value_destroy(one);
@@ -307,11 +384,11 @@ int main() {
         "WHERE key='bool' AND store_id=(SELECT id FROM __esdb_stores WHERE name='typed');",
         &error) == ESDB_OK);
     value = nullptr;
-    CHECK(esdb_store_get(db, "typed", "bool", &value, &error) == ESDB_ERR_CORRUPT);
+    CHECK(esdb_object_store_get(db, "typed", "bool", &value, &error) == ESDB_ERR_CORRUPT);
     CHECK(value == nullptr);
     CHECK(error.status == ESDB_ERR_CORRUPT);
     CHECK(esdb_value_create_bool(1, &value, &error) == ESDB_OK);
-    CHECK(esdb_store_put(db, "typed", "bool", value, nullptr, &error) == ESDB_OK);
+    CHECK(esdb_object_store_put(db, "typed", "bool", value, nullptr, &error) == ESDB_OK);
     esdb_value_destroy(value);
 
     CHECK(esdb_value_create_int32(-1234567, &value, &error) == ESDB_OK);
@@ -320,20 +397,20 @@ int main() {
 
     const int64_t large_i64 = 9223372036854770000LL;
     CHECK(esdb_value_create_int64(large_i64, &value, &error) == ESDB_OK);
-    CHECK(esdb_store_put(db, "typed", "i64", value, nullptr, &error) == ESDB_OK);
+    CHECK(esdb_object_store_put(db, "typed", "i64", value, nullptr, &error) == ESDB_OK);
     esdb_value_destroy(value);
     value = nullptr;
-    CHECK(esdb_store_get(db, "typed", "i64", &value, &error) == ESDB_OK);
+    CHECK(esdb_object_store_get(db, "typed", "i64", &value, &error) == ESDB_OK);
     int64_t loaded_i64 = 0;
     CHECK(esdb_value_get_int64(value, &loaded_i64) == ESDB_OK);
     CHECK(loaded_i64 == large_i64);
     esdb_value_destroy(value);
 
     CHECK(esdb_value_create_double(3.141592653589793, &value, &error) == ESDB_OK);
-    CHECK(esdb_store_put(db, "typed", "double", value, nullptr, &error) == ESDB_OK);
+    CHECK(esdb_object_store_put(db, "typed", "double", value, nullptr, &error) == ESDB_OK);
     esdb_value_destroy(value);
     value = nullptr;
-    CHECK(esdb_store_get(db, "typed", "double", &value, &error) == ESDB_OK);
+    CHECK(esdb_object_store_get(db, "typed", "double", &value, &error) == ESDB_OK);
     double loaded_double = 0.0;
     CHECK(esdb_value_get_double(value, &loaded_double) == ESDB_OK);
     CHECK(std::fabs(loaded_double - 3.141592653589793) < 1e-15);
@@ -355,10 +432,10 @@ int main() {
 
     const unsigned char bytes[] = {0x00u, 0xffu, 0x10u, 0x80u};
     CHECK(esdb_value_create_bytes(bytes, sizeof(bytes), &value, &error) == ESDB_OK);
-    CHECK(esdb_store_put(db, "typed", "bytes", value, nullptr, &error) == ESDB_OK);
+    CHECK(esdb_object_store_put(db, "typed", "bytes", value, nullptr, &error) == ESDB_OK);
     esdb_value_destroy(value);
     value = nullptr;
-    CHECK(esdb_store_get(db, "typed", "bytes", &value, &error) == ESDB_OK);
+    CHECK(esdb_object_store_get(db, "typed", "bytes", &value, &error) == ESDB_OK);
     const void *loaded_bytes = nullptr;
     uint64_t loaded_size = 0u;
     CHECK(esdb_value_get_data(value, &loaded_bytes, &loaded_size) == ESDB_OK);
@@ -378,9 +455,52 @@ int main() {
     check_value_roundtrip(db, "array", value, ESDB_VALUE_ARRAY, &error);
     esdb_value_destroy(value);
 
+    /* Bounded Store scan is key-ordered, paginatable, and callback-reentrant. */
+    const char *scan_keys[] = {"c", "a", "b"};
+    const int32_t scan_values[] = {3, 1, 2};
+    for (int scan_index = 0; scan_index < 3; ++scan_index) {
+        CHECK(esdb_value_create_int32(scan_values[scan_index], &value, &error) == ESDB_OK);
+        CHECK(esdb_object_store_put(
+            db, "scan", scan_keys[scan_index], value, nullptr, &error) == ESDB_OK);
+        esdb_value_destroy(value);
+        value = nullptr;
+    }
+
+    ScanCapture full_scan{};
+    full_scan.database = db;
+    uint32_t scan_count = 0u;
+    CHECK(esdb_object_store_scan(
+        db, "scan", nullptr, 0u, capture_record, &full_scan,
+        &scan_count, &error) == ESDB_OK);
+    CHECK(scan_count == 3u);
+    CHECK(full_scan.keys.size() == 3u);
+    if (full_scan.keys.size() == 3u) {
+        CHECK(full_scan.keys[0] == "a");
+        CHECK(full_scan.keys[1] == "b");
+        CHECK(full_scan.keys[2] == "c");
+        CHECK(full_scan.values[0] == 1);
+        CHECK(full_scan.values[1] == 2);
+        CHECK(full_scan.values[2] == 3);
+    }
+
+    ScanCapture page_scan{};
+    CHECK(esdb_object_store_scan(
+        db, "scan", "a", 1u, capture_record, &page_scan,
+        &scan_count, &error) == ESDB_OK);
+    CHECK(scan_count == 1u);
+    CHECK(page_scan.keys.size() == 1u);
+    if (page_scan.keys.size() == 1u) CHECK(page_scan.keys[0] == "b");
+
+    CHECK(esdb_object_store_scan(
+        db, "scan", nullptr, ESDB_OBJECT_SCAN_LIMIT_MAX + 1u, capture_record,
+        &page_scan, &scan_count, &error) == ESDB_ERR_INVALID_ARGUMENT);
+    CHECK(esdb_object_store_scan(
+        db, "scan", nullptr, 1u, throwing_record, nullptr,
+        &scan_count, &error) == ESDB_ERR_INTERNAL);
+    CHECK(error.status == ESDB_ERR_INTERNAL);
     /* Revision is durable metadata, not the max surviving change row. */
     uint64_t before_prune = 0u;
-    CHECK(esdb_store_revision(db, &before_prune, &error) == ESDB_OK);
+    CHECK(esdb_object_store_revision(db, &before_prune, &error) == ESDB_OK);
     CHECK(before_prune > 0u);
 
     CHECK(esdb_exec(
@@ -388,21 +508,21 @@ int main() {
         "UPDATE __esdb_meta SET value='not-a-revision' WHERE key='store_revision';",
         &error) == ESDB_OK);
     uint64_t corrupt_revision = 0u;
-    CHECK(esdb_store_revision(db, &corrupt_revision, &error) == ESDB_ERR_CORRUPT);
+    CHECK(esdb_object_store_revision(db, &corrupt_revision, &error) == ESDB_ERR_CORRUPT);
     CHECK(error.status == ESDB_ERR_CORRUPT);
     CHECK(esdb_exec(
         db,
         "UPDATE __esdb_meta SET value=CAST((SELECT seq FROM sqlite_sequence "
-        "WHERE name='__esdb_changes') AS TEXT) WHERE key='store_revision';",
+        "WHERE name='__esdb_object_changes') AS TEXT) WHERE key='store_revision';",
         &error) == ESDB_OK);
-    CHECK(esdb_store_revision(db, &corrupt_revision, &error) == ESDB_OK);
+    CHECK(esdb_object_store_revision(db, &corrupt_revision, &error) == ESDB_OK);
     CHECK(corrupt_revision == before_prune);
 
     uint64_t pruned = 0u;
-    CHECK(esdb_store_prune_changes(db, before_prune, &pruned, &error) == ESDB_OK);
+    CHECK(esdb_object_store_prune_changes(db, before_prune, &pruned, &error) == ESDB_OK);
     CHECK(pruned > 0u);
     uint64_t after_prune = 0u;
-    CHECK(esdb_store_revision(db, &after_prune, &error) == ESDB_OK);
+    CHECK(esdb_object_store_revision(db, &after_prune, &error) == ESDB_OK);
     CHECK(after_prune == before_prune);
 
     esdb_close(db);
@@ -410,16 +530,16 @@ int main() {
     CHECK(esdb_open(path.c_str(), &options, &db, &error) == ESDB_OK);
     CHECK(db != nullptr);
     uint64_t after_reopen = 0u;
-    CHECK(esdb_store_revision(db, &after_reopen, &error) == ESDB_OK);
+    CHECK(esdb_object_store_revision(db, &after_reopen, &error) == ESDB_OK);
     CHECK(after_reopen == before_prune);
 
     CHECK(esdb_value_create_int32(7, &value, &error) == ESDB_OK);
     uint64_t rev_a = 0u;
     uint64_t rev_b = 0u;
     uint64_t rev_c = 0u;
-    CHECK(esdb_store_put(db, "changes", "a", value, &rev_a, &error) == ESDB_OK);
-    CHECK(esdb_store_put(db, "changes", "b", value, &rev_b, &error) == ESDB_OK);
-    CHECK(esdb_store_put(db, "changes", "c", value, &rev_c, &error) == ESDB_OK);
+    CHECK(esdb_object_store_put(db, "changes", "a", value, &rev_a, &error) == ESDB_OK);
+    CHECK(esdb_object_store_put(db, "changes", "b", value, &rev_b, &error) == ESDB_OK);
+    CHECK(esdb_object_store_put(db, "changes", "c", value, &rev_c, &error) == ESDB_OK);
     esdb_value_destroy(value);
     CHECK(rev_a > before_prune);
     CHECK(rev_b > rev_a);
@@ -441,7 +561,7 @@ int main() {
                 std::snprintf(key, sizeof(key), "t%02d-k%03d", thread_index, item);
                 esdb_error thread_error{};
                 uint64_t revision = 0u;
-                const esdb_status status = esdb_store_put(
+                const esdb_status status = esdb_object_store_put(
                     db, "concurrent", key, value, &revision, &thread_error);
                 if (status != ESDB_OK || revision == 0u) {
                     concurrent_errors.fetch_add(1, std::memory_order_relaxed);
@@ -462,7 +582,7 @@ int main() {
         concurrent_revisions.begin(), concurrent_revisions.end()) ==
         concurrent_revisions.end());
     uint64_t concurrent_count = 0u;
-    CHECK(esdb_store_count(
+    CHECK(esdb_object_store_count(
         db, "concurrent", &concurrent_count, &error) == ESDB_OK);
     CHECK(concurrent_count == static_cast<uint64_t>(total_writes));
 
@@ -481,8 +601,8 @@ int main() {
                 esdb_error reader_error{};
                 uint64_t revision = 0u;
                 uint64_t count = 0u;
-                if (esdb_store_revision(db, &revision, &reader_error) != ESDB_OK ||
-                    esdb_store_count(db, "rw", &count, &reader_error) != ESDB_OK) {
+                if (esdb_object_store_revision(db, &revision, &reader_error) != ESDB_OK ||
+                    esdb_object_store_count(db, "rw", &count, &reader_error) != ESDB_OK) {
                     rw_errors.fetch_add(1, std::memory_order_relaxed);
                 }
             }
@@ -492,7 +612,7 @@ int main() {
         char key[64]{};
         std::snprintf(key, sizeof(key), "rw-%03d", item);
         uint64_t revision = 0u;
-        CHECK(esdb_store_put(db, "rw", key, value, &revision, &error) == ESDB_OK);
+        CHECK(esdb_object_store_put(db, "rw", key, value, &revision, &error) == ESDB_OK);
         CHECK(revision > 0u);
     }
     rw_stop.store(true, std::memory_order_release);
@@ -501,7 +621,7 @@ int main() {
     value = nullptr;
     CHECK(rw_errors.load(std::memory_order_relaxed) == 0);
     uint64_t rw_count = 0u;
-    CHECK(esdb_store_count(db, "rw", &rw_count, &error) == ESDB_OK);
+    CHECK(esdb_object_store_count(db, "rw", &rw_count, &error) == ESDB_OK);
     CHECK(rw_count == static_cast<uint64_t>(rw_writes));
 
     /* The public revision domain is SQLite's positive signed-64 rowid range. */
@@ -509,66 +629,66 @@ int main() {
     ChangeCount invalid_changes{};
     uint64_t invalid_last = 0u;
     uint32_t invalid_delivered = 0u;
-    CHECK(esdb_store_changes_since(
+    CHECK(esdb_object_store_changes_since(
         db, nullptr, invalid_revision, 1u, count_change, &invalid_changes,
         &invalid_last, &invalid_delivered, &error) == ESDB_ERR_INVALID_ARGUMENT);
-    esdb_subscription *invalid_subscription = nullptr;
-    CHECK(esdb_subscribe(
+    esdb_object_subscription *invalid_subscription = nullptr;
+    CHECK(esdb_object_subscribe(
         db, nullptr, invalid_revision, &invalid_subscription, &error) ==
         ESDB_ERR_INVALID_ARGUMENT);
     CHECK(invalid_subscription == nullptr);
     uint64_t invalid_pruned = 0u;
-    CHECK(esdb_store_prune_changes(
+    CHECK(esdb_object_store_prune_changes(
         db, invalid_revision, &invalid_pruned, &error) == ESDB_ERR_INVALID_ARGUMENT);
 
     /* limit==0 explicitly means the documented maximum. */
     ChangeCount all_changes{};
     uint64_t last = before_prune;
     uint32_t delivered = 0u;
-    CHECK(esdb_store_changes_since(
+    CHECK(esdb_object_store_changes_since(
         db, "changes", before_prune, 0u, count_change, &all_changes,
         &last, &delivered, &error) == ESDB_OK);
     CHECK(delivered == 3u);
     CHECK(all_changes.count == 3u);
     CHECK(last == rev_c);
 
-    esdb_subscription *subscription = nullptr;
-    CHECK(esdb_subscribe(db, "changes", rev_c, &subscription, &error) == ESDB_OK);
+    esdb_object_subscription *subscription = nullptr;
+    CHECK(esdb_object_subscribe(db, "changes", rev_c, &subscription, &error) == ESDB_OK);
     CHECK(esdb_value_create_int32(8, &value, &error) == ESDB_OK);
     uint64_t rev_d = 0u;
     uint64_t rev_e = 0u;
-    CHECK(esdb_store_put(db, "changes", "d", value, &rev_d, &error) == ESDB_OK);
-    CHECK(esdb_store_put(db, "changes", "e", value, &rev_e, &error) == ESDB_OK);
+    CHECK(esdb_object_store_put(db, "changes", "d", value, &rev_d, &error) == ESDB_OK);
+    CHECK(esdb_object_store_put(db, "changes", "e", value, &rev_e, &error) == ESDB_OK);
     esdb_value_destroy(value);
 
     /* Reentrant/concurrent polling of one subscription fails BUSY, not deadlock. */
-    esdb_subscription *reentrant_subscription = nullptr;
-    CHECK(esdb_subscribe(
+    esdb_object_subscription *reentrant_subscription = nullptr;
+    CHECK(esdb_object_subscribe(
         db, "changes", rev_c, &reentrant_subscription, &error) == ESDB_OK);
     ReentrantPoll reentrant{};
     reentrant.subscription = reentrant_subscription;
     uint32_t reentrant_delivered = 0u;
-    CHECK(esdb_subscription_poll(
+    CHECK(esdb_object_subscription_poll(
         reentrant_subscription, 1u, reentrant_poll_change, &reentrant,
         &reentrant_delivered, &error) == ESDB_OK);
     CHECK(reentrant_delivered == 1u);
     CHECK(reentrant.callbacks == 1u);
     CHECK(reentrant.nested_status == ESDB_ERR_BUSY);
     CHECK(reentrant.nested_error_status == ESDB_ERR_BUSY);
-    CHECK(esdb_subscription_revision(reentrant_subscription) == rev_d);
-    esdb_subscription_destroy(reentrant_subscription);
+    CHECK(esdb_object_subscription_revision(reentrant_subscription) == rev_d);
+    esdb_object_subscription_destroy(reentrant_subscription);
 
     ChangeCount subscription_changes{};
     delivered = 0u;
-    CHECK(esdb_subscription_poll(
+    CHECK(esdb_object_subscription_poll(
         subscription, 0u, count_change, &subscription_changes, &delivered, &error) == ESDB_OK);
     CHECK(delivered == 2u);
     CHECK(subscription_changes.count == 2u);
-    CHECK(esdb_subscription_revision(subscription) == rev_e);
-    esdb_subscription_destroy(subscription);
+    CHECK(esdb_object_subscription_revision(subscription) == rev_e);
+    esdb_object_subscription_destroy(subscription);
 
     /* Throwing C++ callbacks are contained by the C ABI. */
-    CHECK(esdb_store_changes_since(
+    CHECK(esdb_object_store_changes_since(
         db, "changes", rev_c, 0u, throwing_change, nullptr,
         &last, &delivered, &error) == ESDB_ERR_INTERNAL);
     CHECK(error.status == ESDB_ERR_INTERNAL);
@@ -576,7 +696,7 @@ int main() {
 
     CHECK(esdb_integrity_check(db, 1, &error) == ESDB_OK);
     uint64_t revision_before_readonly = 0u;
-    CHECK(esdb_store_revision(db, &revision_before_readonly, &error) == ESDB_OK);
+    CHECK(esdb_object_store_revision(db, &revision_before_readonly, &error) == ESDB_OK);
     esdb_close(db);
     db = nullptr;
 
@@ -592,26 +712,26 @@ int main() {
     CHECK(esdb_open(path.c_str(), &read_only_options, &read_only_db, &error) == ESDB_OK);
     CHECK(read_only_db != nullptr);
     value = nullptr;
-    CHECK(esdb_store_get(read_only_db, "typed", "i64", &value, &error) == ESDB_OK);
+    CHECK(esdb_object_store_get(read_only_db, "typed", "i64", &value, &error) == ESDB_OK);
     CHECK(value != nullptr);
     esdb_value_destroy(value);
     value = nullptr;
     uint64_t read_only_revision = 0u;
-    CHECK(esdb_store_revision(read_only_db, &read_only_revision, &error) == ESDB_OK);
+    CHECK(esdb_object_store_revision(read_only_db, &read_only_revision, &error) == ESDB_OK);
     CHECK(read_only_revision == revision_before_readonly);
-    CHECK(esdb_store_ensure(read_only_db, "typed", &error) == ESDB_OK);
-    CHECK(esdb_store_ensure(read_only_db, "missing-store", &error) == ESDB_ERR_IO);
+    CHECK(esdb_object_store_ensure(read_only_db, "typed", &error) == ESDB_OK);
+    CHECK(esdb_object_store_ensure(read_only_db, "missing-store", &error) == ESDB_ERR_IO);
     CHECK(error.status == ESDB_ERR_IO);
     CHECK(error.sqlite_code != 0);
     CHECK(esdb_value_create_int32(123, &value, &error) == ESDB_OK);
-    CHECK(esdb_store_put(
+    CHECK(esdb_object_store_put(
         read_only_db, "typed", "readonly-write", value, nullptr, &error) == ESDB_ERR_IO);
     CHECK(error.status == ESDB_ERR_IO);
     CHECK(error.sqlite_code != 0);
     esdb_value_destroy(value);
     value = nullptr;
     uint64_t readonly_pruned = 0u;
-    CHECK(esdb_store_prune_changes(
+    CHECK(esdb_object_store_prune_changes(
         read_only_db, read_only_revision, &readonly_pruned, &error) == ESDB_ERR_IO);
     CHECK(readonly_pruned == 0u);
     esdb_close(read_only_db);
@@ -623,7 +743,7 @@ int main() {
     esdb_close(empty_db);
     empty_db = nullptr;
     CHECK(esdb_open(empty_path.c_str(), &read_only_options, &empty_db, &error) == ESDB_OK);
-    CHECK(esdb_store_revision(empty_db, &read_only_revision, &error) == ESDB_ERR_NOT_FOUND);
+    CHECK(esdb_object_store_revision(empty_db, &read_only_revision, &error) == ESDB_ERR_NOT_FOUND);
     CHECK(error.status == ESDB_ERR_NOT_FOUND);
     esdb_close(empty_db);
 

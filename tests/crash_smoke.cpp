@@ -1,5 +1,5 @@
 #include <esdb/esdb.h>
-#include <esdb/esdb_store.h>
+#include <esdb/esdb_object_store.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -46,7 +46,7 @@ int child_uncommitted(const char *path) {
 
     esdb_value *value = nullptr;
     if (esdb_value_create_int32(1, &value, &error) != ESDB_OK) return 13;
-    if (esdb_store_put(db, k_store, k_uncommitted, value, nullptr, &error) != ESDB_OK) return 14;
+    if (esdb_object_store_put(db, k_store, k_uncommitted, value, nullptr, &error) != ESDB_OK) return 14;
     esdb_value_destroy(value);
 
     // Simulate abrupt process death: no rollback, transaction destruction, or
@@ -61,7 +61,7 @@ int child_committed(const char *path) {
 
     esdb_value *value = nullptr;
     if (esdb_value_create_int32(2, &value, &error) != ESDB_OK) return 22;
-    if (esdb_store_put(db, k_store, k_committed, value, nullptr, &error) != ESDB_OK) return 23;
+    if (esdb_object_store_put(db, k_store, k_committed, value, nullptr, &error) != ESDB_OK) return 23;
     esdb_value_destroy(value);
 
     // The Store mutation is its own SQLite transaction here. Exit immediately
@@ -121,9 +121,9 @@ int main(int argc, char **argv) {
     esdb_error error{};
     esdb_database *db = nullptr;
     if (!open_wal(path, &db, &error)) return 3;
-    if (esdb_store_ensure(db, k_store, &error) != ESDB_OK) return 4;
+    if (esdb_object_store_ensure(db, k_store, &error) != ESDB_OK) return 4;
     uint64_t baseline_revision = 0;
-    if (esdb_store_revision(db, &baseline_revision, &error) != ESDB_OK) return 5;
+    if (esdb_object_store_revision(db, &baseline_revision, &error) != ESDB_OK) return 5;
     esdb_close(db);
     db = nullptr;
 
@@ -131,10 +131,10 @@ int main(int argc, char **argv) {
 
     if (!open_wal(path, &db, &error)) return 7;
     int exists = 1;
-    if (esdb_store_exists(db, k_store, k_uncommitted, &exists, &error) != ESDB_OK) return 8;
+    if (esdb_object_store_exists(db, k_store, k_uncommitted, &exists, &error) != ESDB_OK) return 8;
     if (exists != 0) return 9;
     uint64_t recovered_revision = 0;
-    if (esdb_store_revision(db, &recovered_revision, &error) != ESDB_OK) return 10;
+    if (esdb_object_store_revision(db, &recovered_revision, &error) != ESDB_OK) return 10;
     if (recovered_revision != baseline_revision) return 11;
     if (esdb_integrity_check(db, 1, &error) != ESDB_OK) return 12;
     esdb_close(db);
@@ -144,9 +144,9 @@ int main(int argc, char **argv) {
 
     if (!open_wal(path, &db, &error)) return 14;
     exists = 0;
-    if (esdb_store_exists(db, k_store, k_committed, &exists, &error) != ESDB_OK) return 15;
+    if (esdb_object_store_exists(db, k_store, k_committed, &exists, &error) != ESDB_OK) return 15;
     if (exists != 1) return 16;
-    if (esdb_store_revision(db, &recovered_revision, &error) != ESDB_OK) return 17;
+    if (esdb_object_store_revision(db, &recovered_revision, &error) != ESDB_OK) return 17;
     if (recovered_revision <= baseline_revision) return 18;
     if (esdb_integrity_check(db, 1, &error) != ESDB_OK) return 19;
     esdb_close(db);

@@ -1,0 +1,23 @@
+{
+  "queries": [
+    {
+      "name": "user.updateName",
+      "kind": "update",
+      "table": "user",
+      "set": [
+        {
+          "column": "name",
+          "param": "name"
+        }
+      ],
+      "where": [
+        {
+          "column": "id",
+          "op": "eq",
+          "param": "id"
+        }
+      ],
+      "cardinality": "changes"
+    }
+  ]
+}

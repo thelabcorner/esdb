@@ -3,6 +3,7 @@
 
 #include "esdb.h"
 #include "esdb_store.h"
+#include "esdb_object_store.h"
 
 #include <cstdint>
 #include <cstring>
@@ -69,6 +70,7 @@ private:
     friend class Transaction;
     friend class Savepoint;
     friend class Value;
+    friend class Store;
 
     esdb_error *output() noexcept {
         esdb_error_clear(&value_);
@@ -251,6 +253,179 @@ private:
     }
 
     esdb_value *native_ = nullptr;
+};
+
+/*
+ * Owned handle to ESDB's process-memory state plane. Named Stores live in the
+ * shared ESDB core registry, so separate native/ExternalObject callers in one
+ * process observe the same state when they resolve the same ESDBCore module.
+ */
+class Store final {
+public:
+    Store() noexcept = default;
+
+    explicit Store(esdb_store *native) noexcept
+        : native_(native) {}
+
+    ~Store() noexcept {
+        reset();
+    }
+
+    Store(const Store &) = delete;
+    Store &operator=(const Store &) = delete;
+
+    Store(Store &&other) noexcept
+        : native_(other.release()) {}
+
+    Store &operator=(Store &&other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    ESDB_NODISCARD explicit operator bool() const noexcept {
+        return native_ != nullptr;
+    }
+
+    ESDB_NODISCARD esdb_store *native_handle() const noexcept {
+        return native_;
+    }
+
+    ESDB_NODISCARD const char *name() const noexcept {
+        return esdb_store_name(native_);
+    }
+
+    esdb_store *release() noexcept {
+        esdb_store *result = native_;
+        native_ = nullptr;
+        return result;
+    }
+
+    void reset(esdb_store *replacement = nullptr) noexcept {
+        if (native_) {
+            esdb_store_close(native_);
+        }
+        native_ = replacement;
+    }
+
+    static Status open(
+        const char *name_utf8,
+        Store &out,
+        Error *error = nullptr) noexcept {
+        esdb_store *native = nullptr;
+        const Status status =
+            esdb_store_open(name_utf8, &native, error ? error->output() : nullptr);
+        if (status == ESDB_OK) {
+            out.reset(native);
+        }
+        return status;
+    }
+
+    static Status destroy(
+        const char *name_utf8,
+        Error *error = nullptr) noexcept {
+        return esdb_store_destroy(name_utf8, error ? error->output() : nullptr);
+    }
+
+    Status put(
+        const char *key_utf8,
+        const Value &value,
+        std::uint64_t *out_revision = nullptr,
+        Error *error = nullptr) noexcept {
+        return esdb_store_put(
+            native_, key_utf8, value.native_handle(), out_revision,
+            error ? error->output() : nullptr);
+    }
+
+    Status patch(
+        const esdb_store_patch_entry *entries,
+        std::uint32_t count,
+        std::uint64_t *out_revision = nullptr,
+        Error *error = nullptr) noexcept {
+        return esdb_store_patch(
+            native_, entries, count, out_revision,
+            error ? error->output() : nullptr);
+    }
+
+    Status get(
+        const char *key_utf8,
+        Value &out,
+        Error *error = nullptr) noexcept {
+        esdb_value *native = nullptr;
+        const Status status = esdb_store_get(
+            native_, key_utf8, &native, error ? error->output() : nullptr);
+        if (status == ESDB_OK) {
+            out.reset(native);
+        }
+        return status;
+    }
+
+    Status erase(
+        const char *key_utf8,
+        bool *out_deleted = nullptr,
+        std::uint64_t *out_revision = nullptr,
+        Error *error = nullptr) noexcept {
+        int deleted = 0;
+        const Status status = esdb_store_delete(
+            native_, key_utf8, &deleted, out_revision,
+            error ? error->output() : nullptr);
+        if (status == ESDB_OK && out_deleted) {
+            *out_deleted = deleted != 0;
+        }
+        return status;
+    }
+
+    Status exists(
+        const char *key_utf8,
+        bool &out_exists,
+        Error *error = nullptr) noexcept {
+        int exists = 0;
+        const Status status = esdb_store_exists(
+            native_, key_utf8, &exists, error ? error->output() : nullptr);
+        if (status == ESDB_OK) {
+            out_exists = exists != 0;
+        }
+        return status;
+    }
+
+    Status count(
+        std::uint64_t &out_count,
+        Error *error = nullptr) noexcept {
+        return esdb_store_count(
+            native_, &out_count, error ? error->output() : nullptr);
+    }
+
+    Status clear(
+        bool *out_cleared = nullptr,
+        std::uint64_t *out_revision = nullptr,
+        Error *error = nullptr) noexcept {
+        int cleared = 0;
+        const Status status = esdb_store_clear(
+            native_, &cleared, out_revision,
+            error ? error->output() : nullptr);
+        if (status == ESDB_OK && out_cleared) {
+            *out_cleared = cleared != 0;
+        }
+        return status;
+    }
+
+    Status revision(
+        std::uint64_t &out_revision,
+        Error *error = nullptr) const noexcept {
+        return esdb_store_revision(
+            native_, &out_revision, error ? error->output() : nullptr);
+    }
+
+    Status retained_floor(
+        std::uint64_t &out_revision,
+        Error *error = nullptr) const noexcept {
+        return esdb_store_retained_floor(
+            native_, &out_revision, error ? error->output() : nullptr);
+    }
+
+private:
+    esdb_store *native_ = nullptr;
 };
 
 class Transaction final {
@@ -542,30 +717,30 @@ public:
         return esdb_native_handle(native_);
     }
 
-    /* ---- Store convenience (optional layer) ---- */
+    /* ---- durable ObjectStore convenience (optional Runtime layer) ---- */
 
-    Status ensure_store(const char *store_name_utf8, Error *error = nullptr) noexcept {
-        return esdb_store_ensure(native_, store_name_utf8, error ? error->output() : nullptr);
+    Status object_store_ensure(const char *store_name_utf8, Error *error = nullptr) noexcept {
+        return esdb_object_store_ensure(native_, store_name_utf8, error ? error->output() : nullptr);
     }
 
-    Status put(
+    Status object_store_put(
         const char *store_name_utf8,
         const char *key_utf8,
         const Value &value,
         std::uint64_t *out_revision = nullptr,
         Error *error = nullptr) noexcept {
-        return esdb_store_put(
+        return esdb_object_store_put(
             native_, store_name_utf8, key_utf8, value.native_handle(), out_revision,
             error ? error->output() : nullptr);
     }
 
-    Status get(
+    Status object_store_get(
         const char *store_name_utf8,
         const char *key_utf8,
         Value &out,
         Error *error = nullptr) noexcept {
         esdb_value *native = nullptr;
-        const Status status = esdb_store_get(
+        const Status status = esdb_object_store_get(
             native_, store_name_utf8, key_utf8, &native, error ? error->output() : nullptr);
         if (status == ESDB_OK) {
             out.reset(native);
@@ -573,14 +748,14 @@ public:
         return status;
     }
 
-    Status erase(
+    Status object_store_erase(
         const char *store_name_utf8,
         const char *key_utf8,
         bool *out_deleted = nullptr,
         std::uint64_t *out_revision = nullptr,
         Error *error = nullptr) noexcept {
         int deleted = 0;
-        const Status status = esdb_store_delete(
+        const Status status = esdb_object_store_delete(
             native_, store_name_utf8, key_utf8, &deleted, out_revision,
             error ? error->output() : nullptr);
         if (status == ESDB_OK && out_deleted) {
@@ -589,13 +764,13 @@ public:
         return status;
     }
 
-    Status exists(
+    Status object_store_exists(
         const char *store_name_utf8,
         const char *key_utf8,
         bool &out_exists,
         Error *error = nullptr) noexcept {
         int exists = 0;
-        const Status status = esdb_store_exists(
+        const Status status = esdb_object_store_exists(
             native_, store_name_utf8, key_utf8, &exists, error ? error->output() : nullptr);
         if (status == ESDB_OK) {
             out_exists = exists != 0;
@@ -603,12 +778,31 @@ public:
         return status;
     }
 
-    Status store_count(const char *store_name_utf8, std::uint64_t &out_count, Error *error = nullptr) noexcept {
-        return esdb_store_count(native_, store_name_utf8, &out_count, error ? error->output() : nullptr);
+    Status object_store_count(const char *store_name_utf8, std::uint64_t &out_count, Error *error = nullptr) noexcept {
+        return esdb_object_store_count(native_, store_name_utf8, &out_count, error ? error->output() : nullptr);
     }
 
-    Status store_revision(std::uint64_t &out_revision, Error *error = nullptr) const noexcept {
-        return esdb_store_revision(native_, &out_revision, error ? error->output() : nullptr);
+    Status object_store_scan(
+        const char *store_name_utf8,
+        const char *after_key_or_null_utf8,
+        std::uint32_t limit,
+        esdb_object_record_callback callback,
+        void *user_data,
+        std::uint32_t *out_record_count = nullptr,
+        Error *error = nullptr) noexcept {
+        return esdb_object_store_scan(
+            native_,
+            store_name_utf8,
+            after_key_or_null_utf8,
+            limit,
+            callback,
+            user_data,
+            out_record_count,
+            error ? error->output() : nullptr);
+    }
+
+    Status object_store_revision(std::uint64_t &out_revision, Error *error = nullptr) const noexcept {
+        return esdb_object_store_revision(native_, &out_revision, error ? error->output() : nullptr);
     }
 
 private:

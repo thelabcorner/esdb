@@ -1,0 +1,171 @@
+{
+  "ir_version": "esdb.ir/v1",
+  "schema": {
+    "name": "metric",
+    "dialect": "sqlite"
+  },
+  "tables": [
+    {
+      "name": "metric",
+      "sql_name": "metric",
+      "columns": [
+        {
+          "name": "id",
+          "sql_name": "id",
+          "type": "integer",
+          "nullable": false,
+          "primary_key": true,
+          "autoincrement": false,
+          "unique": false
+        },
+        {
+          "name": "label",
+          "sql_name": "label",
+          "type": "text",
+          "nullable": false,
+          "primary_key": false,
+          "autoincrement": false,
+          "unique": true
+        },
+        {
+          "name": "score",
+          "sql_name": "score",
+          "type": "real",
+          "nullable": false,
+          "primary_key": false,
+          "autoincrement": false,
+          "unique": false,
+          "default": {
+            "kind": "literal",
+            "type": "real",
+            "value": "0.5"
+          }
+        },
+        {
+          "name": "payload",
+          "sql_name": "payload",
+          "type": "blob",
+          "nullable": true,
+          "primary_key": false,
+          "autoincrement": false,
+          "unique": false
+        },
+        {
+          "name": "note",
+          "sql_name": "note",
+          "type": "text",
+          "nullable": true,
+          "primary_key": false,
+          "autoincrement": false,
+          "unique": false
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "uniques": [
+        [
+          "label"
+        ]
+      ]
+    }
+  ],
+  "queries": [
+    {
+      "name": "metric.deleteById",
+      "kind": "delete",
+      "table": "metric",
+      "where": [
+        {
+          "column": "id",
+          "op": "eq",
+          "param": "id"
+        }
+      ],
+      "cardinality": "changes"
+    },
+    {
+      "name": "metric.findById",
+      "kind": "select",
+      "table": "metric",
+      "where": [
+        {
+          "column": "id",
+          "op": "eq",
+          "param": "id"
+        }
+      ],
+      "cardinality": "one"
+    },
+    {
+      "name": "metric.findByLabel",
+      "kind": "select",
+      "table": "metric",
+      "where": [
+        {
+          "column": "label",
+          "op": "eq",
+          "param": "label"
+        }
+      ],
+      "cardinality": "one"
+    },
+    {
+      "name": "metric.insert",
+      "kind": "insert",
+      "table": "metric",
+      "values": [
+        {
+          "column": "id",
+          "param": "id"
+        },
+        {
+          "column": "label",
+          "param": "label"
+        },
+        {
+          "column": "payload",
+          "param": "payload"
+        },
+        {
+          "column": "note",
+          "param": "note"
+        }
+      ],
+      "cardinality": "changes"
+    },
+    {
+      "name": "metric.list",
+      "kind": "select",
+      "table": "metric",
+      "order_by": [
+        {
+          "column": "id",
+          "direction": "asc"
+        }
+      ],
+      "limit": "limit",
+      "offset": "offset",
+      "cardinality": "many"
+    },
+    {
+      "name": "metric.updateNote",
+      "kind": "update",
+      "table": "metric",
+      "set": [
+        {
+          "column": "note",
+          "param": "note"
+        }
+      ],
+      "where": [
+        {
+          "column": "id",
+          "op": "eq",
+          "param": "id"
+        }
+      ],
+      "cardinality": "changes"
+    }
+  ]
+}

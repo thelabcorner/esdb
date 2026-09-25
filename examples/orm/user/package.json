@@ -1,0 +1,15 @@
+{
+  "name": "@esdb/example-orm-user",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ESDB ORM vertical slice: User schema, generated IR/C++/ES3/TS artifacts, and migration package.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "regenerate": "node scripts/regenerate.mjs",
+    "check": "node scripts/check.mjs"
+  },
+  "dependencies": {
+    "drizzle-orm": "0.45.3"
+  }
+}

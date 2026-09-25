@@ -1,7 +1,6 @@
 #include <esdb/esdb.h>
-#include <esdb/esdb_store.h>
+#include <esdb/esdb_object_store.h>
 
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -77,7 +76,7 @@ int writer(const char *path, const char *prefix) {
         char key[64]{};
         std::snprintf(key, sizeof(key), "%s-%02d", prefix, index);
         const esdb_status put_status =
-            esdb_store_put(db, k_store, key, value, nullptr, &error);
+            esdb_object_store_put(db, k_store, key, value, nullptr, &error);
         if (put_status != ESDB_OK) {
             std::fprintf(
                 stderr,
@@ -166,7 +165,7 @@ struct RevisionAudit {
     bool monotonic = true;
 };
 
-int audit_change(const esdb_change *change, void *user_data) {
+int audit_change(const esdb_object_change *change, void *user_data) {
     auto *audit = static_cast<RevisionAudit *>(user_data);
     if (!change || change->revision <= audit->previous) {
         audit->monotonic = false;
@@ -214,17 +213,17 @@ int main(int argc, char **argv) {
     if (!open_database(path, true, &db, &error)) return 8;
 
     std::uint64_t count = 0u;
-    if (esdb_store_count(db, k_store, &count, &error) != ESDB_OK) return 9;
+    if (esdb_object_store_count(db, k_store, &count, &error) != ESDB_OK) return 9;
     if (count != static_cast<std::uint64_t>(k_writes_per_process * 2)) return 10;
 
     std::uint64_t revision = 0u;
-    if (esdb_store_revision(db, &revision, &error) != ESDB_OK) return 11;
+    if (esdb_object_store_revision(db, &revision, &error) != ESDB_OK) return 11;
     if (revision != count) return 12;
 
     RevisionAudit audit{};
     std::uint64_t last = 0u;
     std::uint32_t delivered = 0u;
-    if (esdb_store_changes_since(
+    if (esdb_object_store_changes_since(
             db,
             k_store,
             0u,

@@ -2,9 +2,8 @@
 
 ## Principle
 
-ESDB is a reusable Adobe-native application-state and persistence platform whose durable kernel is SQLite.
-
-It is intentionally split into two tiers.
+ESDB is a reusable Adobe-native Runtime and optional application-state toolkit whose durable kernel is
+SQLite. Runtime is independent from both state APIs: a product may use its own relational schema directly.
 
 ## ESDB Runtime
 
@@ -40,21 +39,19 @@ workmark-helper
 
 ESDB must not move SQLite into Illustrator's in-process .aip, replace VectorIPC, or turn Workmark records into generic Store blobs.
 
-## ESDB Store
+## State APIs
 
-Store is an optional layer above Runtime:
+ESDB exposes two distinct optional state APIs; they share the typed-value domain but not persistence or
+revision semantics:
 
-~~~text
-(store, key) -> typed value
-                  |
-               revision
-                  |
-              change log
-~~~
+| API | Entry point | Storage/lifetime | Change history |
+|---|---|---|---|
+| **ObjectStore** | `db.objectStore(name)` / `esdb_object_store.h` | SQLite-backed and durable | Persistent global revisions; application-controlled pruning; no synthesized gap event in v0.1 |
+| **Store** | `ESDB.store(name)` / `esdb_store.h` | Process-memory registry shared by clients using the same shared ESDB core; discarded at process exit or explicit destroy | Per-named-store revisions; bounded 4,096-change journal; `retainedFloor()` and `ESDB_ERR_GAP` for expired cursors |
 
-Its job is ergonomic application state and durable object storage, not replacement of relational SQL.
-
-The current Store schema uses reserved __esdb_ tables. Consumers must not create or mutate tables under that prefix.
+ObjectStore-owned SQLite objects use the reserved `__esdb_` prefix. Consumers must not create or mutate
+tables under that prefix. The process-memory Store creates no SQLite objects and performs no database I/O.
+Neither state API replaces product-owned relational SQL.
 
 ## Canonical values
 
@@ -64,21 +61,37 @@ ARRAY and OBJECT are tagged structured-text payloads in v0.1. The tag is part of
 
 The database format is not an ExtendScript object representation.
 
+### ExtendScript transport
+
+The ESABI adapter exposes durable ObjectStore and process-memory Store operations directly while keeping the Adobe ABI transport separate from the native value representation. Because the measured ExternalObject string lane cannot faithfully carry embedded U+0000 or every surrogate/astral sequence, the high-level JSX facade converts byte-exact strings to ASCII hex over the boundary and reconstructs UTF-8 on the native side. INT64/revision/count values use canonical decimal strings rather than JavaScript Number.
+
+ARRAY/OBJECT values remain UTF-8 structured payloads. The JSX facade can use ESON or another explicit `{parse,stringify}` peer codec; ESDB does not bundle ESON or make its parser part of the storage format.
+
+Database transactions exposed to JSX are canonical native ESDB transactions owned by the adapter slot.
+`ObjectStore.patch()` is applied transactionally through that database; process-memory `Store.patch()` is
+atomic under its Store lock and does not open a SQLite transaction.
+
 ## Revisions and reactivity
 
-Each committed Store mutation receives a global monotonically increasing revision.
+Each committed ObjectStore mutation receives a durable monotonically increasing revision stored separately
+from surviving change rows. Process-memory Store revisions are monotonic for that named Store while it is
+alive, but are not persisted across process exit.
 
-The current revision is persisted separately from surviving change rows. Therefore:
+For ObjectStore, the current revision is persisted separately from surviving change rows. Therefore:
 
 - pruning all change rows does not reset revision;
 - reopening does not reset revision;
 - a later mutation receives a greater revision.
 
-Change delivery is pull-based. Native consumers and future JSX Store consumers poll changes since a known revision. ESDB does not call arbitrary ExtendScript from a native thread.
+Change delivery is pull-based. Native consumers and JSX callers poll changes since a known revision. ESDB
+does not call arbitrary ExtendScript from a native thread.
 
-limit == 0 means ESDB_CHANGE_LIMIT_MAX.
+For ObjectStore, `limit == 0` means `ESDB_OBJECT_CHANGE_LIMIT_MAX`. The in-memory Store uses its own
+`ESDB_STORE_CHANGE_LIMIT_MAX` limit.
 
-Pruning history is explicit. v0.1 does not synthesize a gap event when a caller asks for history already pruned; applications needing that guarantee must coordinate pruning with acknowledged cursors.
+ObjectStore pruning is explicit. v0.1 does not synthesize a gap event when a caller asks for history
+already pruned; applications needing that guarantee must coordinate pruning with acknowledged cursors. The
+memory Store instead bounds history automatically and reports `ESDB_ERR_GAP` below its retained floor.
 
 ## Concurrency
 
@@ -88,7 +101,13 @@ ESDB_OPEN_FULLMUTEX is the default and permits SQLite calls on a connection from
 
 ESDB_OPEN_NOMUTEX requires external serialization of all use of that connection.
 
-ESDB Store serializes complete Store mutations per connection and serializes invariant-sensitive reads against those writers. Standalone Store mutations begin with `BEGIN IMMEDIATE`, so SQLite's configured busy handler arbitrates the writer slot before mutation work begins; inside an existing transaction ESDB uses an internal savepoint. Change queries snapshot their bounded result set under the Store mutex and invoke callbacks only after releasing it. This removes connection-global result races, prevents Store transaction sequences from interleaving, and prevents readers from observing a change/record/revision sequence half-applied; it does not replace application-level transaction ownership.
+ObjectStore serializes complete durable mutations per connection and serializes invariant-sensitive reads
+against those writers. Standalone mutations begin with `BEGIN IMMEDIATE`, so SQLite's configured busy
+handler arbitrates the writer slot before mutation work begins; inside an existing transaction ESDB uses an
+internal savepoint. Change queries snapshot their bounded result set under the connection Store mutex and
+invoke callbacks only after releasing it. The process-memory Store has a separate per-store mutex for
+mutations, reads, and snapshots. Neither mechanism replaces application-level transaction ownership for
+multi-call Runtime sequences.
 
 No operation may race esdb_close. Database handles must outlive transaction/savepoint/subscription handles.
 
@@ -100,9 +119,14 @@ ESDB rejects explicit `journal_mode=MEMORY`, `journal_mode=OFF`, and `synchronou
 
 Native callers may intentionally bypass policy through the SQLite escape hatch, but health reporting reflects the observed configuration.
 
-Store v0.1 mutations are transactional and durable at the surrounding SQLite commit boundary. When no outer transaction exists, a successful mutation releases its outermost savepoint and commits. When an outer transaction exists, returned state/revisions remain provisional until the caller commits it.
+ObjectStore v0.1 mutations are transactional and durable at the surrounding SQLite commit boundary. When
+no outer transaction exists, a successful mutation commits; when an outer transaction exists, returned
+state/revisions remain provisional until the caller commits it. Process-memory Store mutations are
+synchronous and in-memory; they are not covered by SQLite durability or database transactions.
 
-Future Store policy vocabulary is reserved for memory, buffered, durable, and cache. Those modes are not exposed before implementations exist.
+ObjectStore currently provides one SQLite-backed transactional persistence behavior; buffered/cache
+persistence tiers are not implemented. Process-memory Store is a separate API, not a persistence mode on
+ObjectStore.
 
 ## Backend contract
 

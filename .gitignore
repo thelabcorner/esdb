@@ -4,6 +4,7 @@
 /install-*/
 /consumer-*/
 /embed-*/
+/orm-native/
 /.idea/
 /.vs/
 *.obj

@@ -1,0 +1,287 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://esdb.dev/schemas/esdb-ir-v1.schema.json",
+  "title": "ESDB ORM IR v1",
+  "description": "Informative JSON Schema for the ESDB ORM IR v1 document. The esdb-schema compiler (tools/esdb-schema/) is normative; this schema exists so external tools can validate documents without running the compiler. IR v1 contains no JSON numbers.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ir_version", "schema", "tables"],
+  "properties": {
+    "ir_version": {
+      "const": "esdb.ir/v1"
+    },
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "dialect"],
+      "properties": {
+        "name": { "$ref": "#/$defs/identifier" },
+        "dialect": { "const": "sqlite" },
+        "namespace": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "tables": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/table" }
+    },
+    "queries": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/query" }
+    },
+    "integrity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "canonical", "hash"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "canonical": { "const": "esdb-canonical-json-v1" },
+        "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "generator": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "source": { "type": "string" }
+      }
+    },
+    "annotations": {
+      "type": "object"
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+    },
+    "sqlIdentifier": {
+      "allOf": [
+        { "$ref": "#/$defs/identifier" },
+        { "not": { "pattern": "^(?:[sS][qQ][lL][iI][tT][eE]_|__[eE][sS][dD][bB]_)" } }
+      ]
+    },
+    "queryName": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}(\\.[A-Za-z_][A-Za-z0-9_]{0,63})?$"
+    },
+    "literal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "type", "value"],
+      "properties": {
+        "kind": { "const": "literal" },
+        "type": { "enum": ["integer", "text", "real", "blob", "null"] },
+        "value": { "type": "string" }
+      }
+    },
+    "column": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "sql_name", "type", "nullable", "primary_key", "autoincrement", "unique"],
+      "properties": {
+        "name": { "$ref": "#/$defs/identifier" },
+        "sql_name": { "$ref": "#/$defs/sqlIdentifier" },
+        "type": { "enum": ["integer", "text", "real", "blob"] },
+        "nullable": { "type": "boolean" },
+        "primary_key": { "type": "boolean" },
+        "autoincrement": { "type": "boolean" },
+        "unique": { "type": "boolean" },
+        "default": { "$ref": "#/$defs/literal" }
+      }
+    },
+    "table": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "sql_name", "columns", "primary_key", "uniques"],
+      "properties": {
+        "name": { "$ref": "#/$defs/identifier" },
+        "sql_name": { "$ref": "#/$defs/sqlIdentifier" },
+        "columns": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/column" }
+        },
+        "primary_key": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "uniques": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "$ref": "#/$defs/identifier" }
+          }
+        },
+        "defaults": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/literal" }
+        },
+        "foreign_keys": { "type": "array", "items": { "$ref": "#/$defs/foreignKey" } },
+        "checks": { "type": "array", "items": { "$ref": "#/$defs/check" } },
+        "indexes": { "type": "array", "items": { "$ref": "#/$defs/index" } }
+      }
+    },
+    "schemaExpression": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192
+    },
+    "foreignKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["columns", "references", "on_update", "on_delete"],
+      "properties": {
+        "name": { "$ref": "#/$defs/sqlIdentifier" },
+        "columns": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/identifier" } },
+        "references": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["table", "columns"],
+          "properties": {
+            "table": { "$ref": "#/$defs/identifier" },
+            "columns": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/identifier" } }
+          }
+        },
+        "on_update": { "enum": ["no action", "restrict", "cascade", "set null", "set default"] },
+        "on_delete": { "enum": ["no action", "restrict", "cascade", "set null", "set default"] }
+      }
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "sql"],
+      "properties": {
+        "name": { "$ref": "#/$defs/sqlIdentifier" },
+        "sql": { "$ref": "#/$defs/schemaExpression" }
+      }
+    },
+    "indexTerm": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "column", "direction"],
+          "properties": {
+            "kind": { "const": "column" },
+            "column": { "$ref": "#/$defs/identifier" },
+            "direction": { "enum": ["asc", "desc"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "sql"],
+          "properties": {
+            "kind": { "const": "expression" },
+            "sql": { "$ref": "#/$defs/schemaExpression" }
+          }
+        }
+      ]
+    },
+    "index": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "unique", "terms"],
+      "properties": {
+        "name": { "$ref": "#/$defs/sqlIdentifier" },
+        "unique": { "type": "boolean" },
+        "terms": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/indexTerm" } },
+        "where": { "$ref": "#/$defs/schemaExpression" }
+      }
+    },
+    "condition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["column", "op", "param"],
+      "properties": {
+        "table": { "$ref": "#/$defs/identifier" },
+        "column": { "$ref": "#/$defs/identifier" },
+        "op": { "const": "eq" },
+        "param": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "columnRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["table", "column"],
+      "properties": {
+        "table": { "$ref": "#/$defs/identifier" },
+        "column": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "join": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "table", "on"],
+      "properties": {
+        "kind": { "enum": ["inner", "left"] },
+        "table": { "$ref": "#/$defs/identifier" },
+        "on": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["left", "right"],
+            "properties": {
+              "left": { "$ref": "#/$defs/columnRef" },
+              "right": { "$ref": "#/$defs/columnRef" }
+            }
+          }
+        }
+      }
+    },
+    "assignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["column", "param"],
+      "properties": {
+        "column": { "$ref": "#/$defs/identifier" },
+        "param": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "orderTerm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["column", "direction"],
+      "properties": {
+        "table": { "$ref": "#/$defs/identifier" },
+        "column": { "$ref": "#/$defs/identifier" },
+        "direction": { "enum": ["asc", "desc"] }
+      }
+    },
+    "query": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind", "table", "cardinality"],
+      "properties": {
+        "name": { "$ref": "#/$defs/queryName" },
+        "kind": { "enum": ["select", "insert", "upsert", "update", "delete"] },
+        "table": { "$ref": "#/$defs/identifier" },
+        "cardinality": { "enum": ["one", "many", "changes"] },
+        "where": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/condition" } },
+        "joins": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/join" } },
+        "order_by": { "type": "array", "items": { "$ref": "#/$defs/orderTerm" } },
+        "limit": { "$ref": "#/$defs/identifier" },
+        "offset": { "$ref": "#/$defs/identifier" },
+        "values": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/assignment" } },
+        "set": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/assignment" } },
+        "on_conflict": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["target", "action"],
+          "properties": {
+            "target": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/identifier" } },
+            "action": { "enum": ["nothing", "update"] },
+            "set": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/assignment" } }
+          }
+        }
+      }
+    }
+  }
+}

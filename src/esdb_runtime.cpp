@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -140,7 +141,7 @@ esdb_status Statement::prepare(esdb_database *database, const char *sql, esdb_ph
                     database ? database->handle : nullptr, SQLITE_MISUSE,
                     "invalid database or SQL for prepare");
     }
-    const int rc = sqlite3_prepare_v2(database->handle, sql, -1, &statement_, nullptr);
+    const int rc = sqlite3_prepare_v3(database->handle, sql, -1, SQLITE_PREPARE_PERSISTENT, &statement_, nullptr);
     if (rc != SQLITE_OK) {
         statement_ = nullptr;
         return fail(database, error, map_sqlite_status(rc), phase, database->handle, rc, nullptr);
@@ -280,12 +281,12 @@ bool valid_c_string(const char *text, std::size_t max_bytes) noexcept {
     return length > 0 && length <= max_bytes && valid_utf8(text, static_cast<std::uint64_t>(length));
 }
 
-bool valid_store_name(const char *text) noexcept {
-    return valid_c_string(text, ESDB_STORE_NAME_MAX_BYTES);
+bool valid_object_store_name(const char *text) noexcept {
+    return valid_c_string(text, ESDB_OBJECT_STORE_NAME_MAX_BYTES);
 }
 
-bool valid_store_key(const char *text) noexcept {
-    return valid_c_string(text, ESDB_STORE_KEY_MAX_BYTES);
+bool valid_object_store_key(const char *text) noexcept {
+    return valid_c_string(text, ESDB_OBJECT_STORE_KEY_MAX_BYTES);
 }
 
 bool valid_savepoint_name(const char *text) noexcept {
@@ -422,6 +423,7 @@ const char *esdb_status_name(esdb_status status) {
         case ESDB_ERR_INVALID_STATE: return "invalid_state";
         case ESDB_ERR_MIGRATION: return "migration";
         case ESDB_ERR_INTERNAL: return "internal";
+        case ESDB_ERR_GAP: return "gap";
         default: return "unknown";
     }
 }
@@ -441,6 +443,7 @@ const char *esdb_phase_name(esdb_phase phase) {
         case ESDB_PHASE_STORE: return "store";
         case ESDB_PHASE_SUBSCRIPTION: return "subscription";
         case ESDB_PHASE_HEALTH: return "health";
+        case ESDB_PHASE_OBJECT_STORE: return "object_store";
         default: return "unknown";
     }
 }
@@ -458,6 +461,10 @@ void esdb_open_options_init(esdb_open_options *options) {
     options->cache_kib = 0u;
     options->wal_autocheckpoint_pages = 0u;
     options->foreign_keys = 1u;
+    options->storage_mode = ESDB_STORAGE_DEFAULT;
+    options->storage_provider = ESDB_PROVIDER_AUTO;
+    options->compression_codec = ESDB_CODEC_NONE;
+    options->compression_level = 0;
 }
 
 /* ---- backend capabilities ---- */
@@ -477,7 +484,13 @@ esdb_status esdb_backend_capabilities_get(esdb_backend_capabilities *out_capabil
     }
     std::memset(out_capabilities, 0, sizeof(*out_capabilities));
     out_capabilities->struct_size = sizeof(*out_capabilities);
-    std::snprintf(out_capabilities->backend_id, sizeof(out_capabilities->backend_id), "%s", "sqlite");
+    const bool has_zipvfs = esdb_detail::zipvfs_compiled();
+    const bool has_zstd = esdb_detail::zipvfs_zstd_compiled();
+    std::snprintf(
+        out_capabilities->backend_id,
+        sizeof(out_capabilities->backend_id),
+        "%s",
+        has_zipvfs ? "sqlite+zipvfs" : "sqlite");
     std::snprintf(out_capabilities->backend_version, sizeof(out_capabilities->backend_version), "%s", sqlite3_libversion());
     out_capabilities->backend_version_number = static_cast<uint32_t>(sqlite3_libversion_number());
     out_capabilities->supports_wal = 1u;
@@ -486,10 +499,16 @@ esdb_status esdb_backend_capabilities_get(esdb_backend_capabilities *out_capabil
     out_capabilities->supports_backup = 1u;
     out_capabilities->supports_savepoints = 1u;
     out_capabilities->supports_uri = 1u;
-    out_capabilities->compression_supported = 0u;
+    out_capabilities->compression_supported = has_zipvfs ? 1u : 0u;
     out_capabilities->page_codec = ESDB_CODEC_NONE;
     out_capabilities->codec_version = 0u;
-    std::snprintf(out_capabilities->codec_id, sizeof(out_capabilities->codec_id), "%s", "none");
+    std::snprintf(
+        out_capabilities->codec_id,
+        sizeof(out_capabilities->codec_id),
+        "%s",
+        has_zipvfs
+            ? (has_zstd ? "deflate,zstd" : "deflate")
+            : "none");
     return ESDB_OK;
 }
 
@@ -535,6 +554,87 @@ static bool valid_journal_request(esdb_journal_mode mode) noexcept {
         case ESDB_JOURNAL_OFF:
         default:
             return false;
+    }
+}
+
+static esdb_status validate_storage_request(
+    const esdb_open_options &options,
+    esdb_error *error) noexcept {
+    switch (options.storage_mode) {
+        case ESDB_STORAGE_DEFAULT:
+        case ESDB_STORAGE_PLAIN:
+            if (options.storage_provider != ESDB_PROVIDER_AUTO &&
+                options.storage_provider != ESDB_PROVIDER_SQLITE) {
+                esdb_detail::set_error(
+                    error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_OPEN,
+                    nullptr, SQLITE_MISUSE,
+                    "plain storage cannot use a compressed storage provider");
+                return ESDB_ERR_INVALID_ARGUMENT;
+            }
+            if (options.compression_codec != ESDB_CODEC_NONE ||
+                options.compression_level != 0) {
+                esdb_detail::set_error(
+                    error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_OPEN,
+                    nullptr, SQLITE_MISUSE,
+                    "plain storage requires codec=NONE and compression_level=0");
+                return ESDB_ERR_INVALID_ARGUMENT;
+            }
+            return ESDB_OK;
+
+        case ESDB_STORAGE_COMPRESSED:
+            if (options.storage_provider != ESDB_PROVIDER_AUTO &&
+                options.storage_provider != ESDB_PROVIDER_ZIPVFS) {
+                esdb_detail::set_error(
+                    error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_OPEN,
+                    nullptr, SQLITE_MISUSE,
+                    "compressed storage requires ZIPVFS or AUTO provider selection");
+                return ESDB_ERR_INVALID_ARGUMENT;
+            }
+            if (options.compression_codec != ESDB_CODEC_ZSTD &&
+                options.compression_codec != ESDB_CODEC_DEFLATE) {
+                esdb_detail::set_error(
+                    error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_OPEN,
+                    nullptr, SQLITE_MISUSE,
+                    "compressed storage requires ZSTD or DEFLATE codec selection");
+                return ESDB_ERR_INVALID_ARGUMENT;
+            }
+            if (!esdb_detail::zipvfs_compiled()) {
+                esdb_detail::set_error(
+                    error, ESDB_ERR_UNSUPPORTED, ESDB_PHASE_OPEN,
+                    nullptr, SQLITE_NOTFOUND,
+                    "this ESDB build does not contain licensed ZIPVFS support");
+                return ESDB_ERR_UNSUPPORTED;
+            }
+            if (options.compression_codec == ESDB_CODEC_ZSTD &&
+                !esdb_detail::zipvfs_zstd_compiled()) {
+                esdb_detail::set_error(
+                    error, ESDB_ERR_UNSUPPORTED, ESDB_PHASE_OPEN,
+                    nullptr, SQLITE_NOTFOUND,
+                    "this ZIPVFS build does not contain the optional Zstd codec");
+                return ESDB_ERR_UNSUPPORTED;
+            }
+            if (options.journal_mode != ESDB_JOURNAL_UNCHANGED &&
+                options.journal_mode != ESDB_JOURNAL_WAL) {
+                esdb_detail::set_error(
+                    error, ESDB_ERR_UNSUPPORTED, ESDB_PHASE_OPEN,
+                    nullptr, SQLITE_MISUSE,
+                    "ZIPVFS currently supports ESDB journal selection UNCHANGED or WAL");
+                return ESDB_ERR_UNSUPPORTED;
+            }
+            if (options.synchronous != ESDB_SYNCHRONOUS_UNCHANGED) {
+                esdb_detail::set_error(
+                    error, ESDB_ERR_UNSUPPORTED, ESDB_PHASE_OPEN,
+                    nullptr, SQLITE_MISUSE,
+                    "ZIPVFS lower-pager synchronous tuning is provider-specific; leave ESDB synchronous UNCHANGED");
+                return ESDB_ERR_UNSUPPORTED;
+            }
+            return ESDB_OK;
+
+        default:
+            esdb_detail::set_error(
+                error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_OPEN,
+                nullptr, SQLITE_MISUSE, "unknown storage mode");
+            return ESDB_ERR_INVALID_ARGUMENT;
     }
 }
 
@@ -606,7 +706,11 @@ static esdb_status configure_database(esdb_database *database, const esdb_open_o
                                  database->handle, SQLITE_MISUSE,
                                  "non-durable journal mode is not supported by the ESDB durability policy");
     }
-    const char *journal = journal_mode_sql(options.journal_mode);
+    const bool compressed =
+        options.storage_mode == ESDB_STORAGE_COMPRESSED;
+    const char *journal = compressed && options.journal_mode == ESDB_JOURNAL_WAL
+        ? "PRAGMA zipvfs_journal_mode=WAL;"
+        : journal_mode_sql(options.journal_mode);
     if (options.journal_mode != ESDB_JOURNAL_UNCHANGED) {
         if (!journal) {
             return esdb_detail::fail(database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_CONFIGURE,
@@ -617,7 +721,10 @@ static esdb_status configure_database(esdb_database *database, const esdb_open_o
 
         esdb_detail::Statement journal_query;
         status = journal_query.prepare(
-            database, "PRAGMA journal_mode;", ESDB_PHASE_CONFIGURE, error);
+            database,
+            compressed ? "PRAGMA zipvfs_journal_mode;" : "PRAGMA journal_mode;",
+            ESDB_PHASE_CONFIGURE,
+            error);
         if (status != ESDB_OK) return status;
         int step = 0;
         status = journal_query.step(database, &step, ESDB_PHASE_CONFIGURE, error);
@@ -736,6 +843,15 @@ esdb_status esdb_open(const char *path_utf8, const esdb_open_options *options, e
                                "invalid, unknown, or non-durable synchronous mode");
         return ESDB_ERR_INVALID_ARGUMENT;
     }
+    const esdb_status storage_status =
+        validate_storage_request(resolved, error);
+    if (storage_status != ESDB_OK) return storage_status;
+
+    const char *storage_vfs = nullptr;
+    const esdb_status vfs_status =
+        esdb_detail::storage_vfs_select(resolved, &storage_vfs, error);
+    if (vfs_status != ESDB_OK) return vfs_status;
+
     if (resolved.foreign_keys > 1u) {
         esdb_detail::set_error(error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_OPEN, nullptr, SQLITE_MISUSE,
                                "foreign_keys must be 0 or 1");
@@ -758,7 +874,11 @@ esdb_status esdb_open(const char *path_utf8, const esdb_open_options *options, e
     database->options = resolved;
     esdb_detail::count_operation(database);
 
-    const int rc = sqlite3_open_v2(path_utf8, &database->handle, sqlite_open_flags(resolved.flags), nullptr);
+    const int rc = sqlite3_open_v2(
+        path_utf8,
+        &database->handle,
+        sqlite_open_flags(resolved.flags),
+        storage_vfs);
     if (rc != SQLITE_OK) {
         const esdb_status status = esdb_detail::map_sqlite_status(rc);
         esdb_detail::fail(database, error, status, ESDB_PHASE_OPEN, database->handle, rc, nullptr);
@@ -766,6 +886,15 @@ esdb_status esdb_open(const char *path_utf8, const esdb_open_options *options, e
         delete database;
         return status;
     }
+
+    const esdb_status verified =
+        esdb_detail::storage_verify_open(database->handle, resolved, error);
+    if (verified != ESDB_OK) {
+        sqlite3_close_v2(database->handle);
+        delete database;
+        return verified;
+    }
+
     const esdb_status configured = configure_database(database, resolved, error);
     if (configured != ESDB_OK) {
         sqlite3_close_v2(database->handle);
@@ -806,6 +935,394 @@ esdb_status esdb_exec(esdb_database *database, const char *sql_utf8, esdb_error 
             }
         }
     }
+    return status;
+}
+
+
+namespace {
+
+bool esdb_query_tail_is_empty(const char *tail) noexcept {
+    if (!tail) return true;
+    while (*tail) {
+        const unsigned char c = static_cast<unsigned char>(*tail);
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n' && c != '\f' && c != '\v') {
+            return false;
+        }
+        ++tail;
+    }
+    return true;
+}
+
+struct QueryStatementGuard {
+    sqlite3_stmt *statement = nullptr;
+
+    ~QueryStatementGuard() noexcept {
+        finalize();
+    }
+
+    QueryStatementGuard() = default;
+    QueryStatementGuard(const QueryStatementGuard &) = delete;
+    QueryStatementGuard &operator=(const QueryStatementGuard &) = delete;
+
+    void finalize() noexcept {
+        if (statement) {
+            sqlite3_finalize(statement);
+            statement = nullptr;
+        }
+    }
+};
+
+struct QueryOwnedValueGuard {
+    std::vector<esdb_value *> values;
+
+    QueryOwnedValueGuard() = default;
+    QueryOwnedValueGuard(const QueryOwnedValueGuard &) = delete;
+    QueryOwnedValueGuard &operator=(const QueryOwnedValueGuard &) = delete;
+
+    ~QueryOwnedValueGuard() noexcept {
+        clear();
+    }
+
+    void clear() noexcept {
+        for (esdb_value *value : values) {
+            esdb_value_destroy(value);
+        }
+        values.clear();
+    }
+};
+
+esdb_status esdb_query_bind_value(
+    esdb_database *database,
+    sqlite3_stmt *statement,
+    int index,
+    const esdb_value *value,
+    esdb_error *error) noexcept {
+    if (!value) {
+        return esdb_detail::fail(
+            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_EXEC,
+            database ? database->handle : nullptr, SQLITE_MISUSE,
+            "query parameter value is null");
+    }
+
+    int rc = SQLITE_MISUSE;
+    switch (esdb_value_type_of(value)) {
+        case ESDB_VALUE_NULL:
+            rc = sqlite3_bind_null(statement, index);
+            break;
+        case ESDB_VALUE_BOOL: {
+            int decoded = 0;
+            if (esdb_value_get_bool(value, &decoded) != ESDB_OK) {
+                return esdb_detail::fail(
+                    database, error, ESDB_ERR_TYPE_MISMATCH, ESDB_PHASE_EXEC,
+                    database->handle, SQLITE_MISMATCH, "invalid BOOL query parameter");
+            }
+            rc = sqlite3_bind_int(statement, index, decoded ? 1 : 0);
+            break;
+        }
+        case ESDB_VALUE_INT32: {
+            std::int32_t decoded = 0;
+            if (esdb_value_get_int32(value, &decoded) != ESDB_OK) {
+                return esdb_detail::fail(
+                    database, error, ESDB_ERR_TYPE_MISMATCH, ESDB_PHASE_EXEC,
+                    database->handle, SQLITE_MISMATCH, "invalid INT32 query parameter");
+            }
+            rc = sqlite3_bind_int(statement, index, decoded);
+            break;
+        }
+        case ESDB_VALUE_INT64: {
+            std::int64_t decoded = 0;
+            if (esdb_value_get_int64(value, &decoded) != ESDB_OK) {
+                return esdb_detail::fail(
+                    database, error, ESDB_ERR_TYPE_MISMATCH, ESDB_PHASE_EXEC,
+                    database->handle, SQLITE_MISMATCH, "invalid INT64 query parameter");
+            }
+            rc = sqlite3_bind_int64(statement, index, static_cast<sqlite3_int64>(decoded));
+            break;
+        }
+        case ESDB_VALUE_DOUBLE: {
+            double decoded = 0.0;
+            if (esdb_value_get_double(value, &decoded) != ESDB_OK) {
+                return esdb_detail::fail(
+                    database, error, ESDB_ERR_TYPE_MISMATCH, ESDB_PHASE_EXEC,
+                    database->handle, SQLITE_MISMATCH, "invalid DOUBLE query parameter");
+            }
+            if (std::isnan(decoded)) {
+                return esdb_detail::fail(
+                    database, error, ESDB_ERR_UNSUPPORTED, ESDB_PHASE_EXEC,
+                    database->handle, SQLITE_MISMATCH,
+                    "NaN DOUBLE query parameters are not representable by SQLite");
+            }
+            rc = sqlite3_bind_double(statement, index, decoded);
+            break;
+        }
+        case ESDB_VALUE_UTF8:
+        case ESDB_VALUE_ARRAY:
+        case ESDB_VALUE_OBJECT:
+        case ESDB_VALUE_BYTES: {
+            const void *data = nullptr;
+            std::uint64_t size = 0u;
+            if (esdb_value_get_data(value, &data, &size) != ESDB_OK) {
+                return esdb_detail::fail(
+                    database, error, ESDB_ERR_TYPE_MISMATCH, ESDB_PHASE_EXEC,
+                    database->handle, SQLITE_MISMATCH, "invalid query parameter payload");
+            }
+            if (esdb_value_type_of(value) == ESDB_VALUE_BYTES) {
+                rc = size == 0u
+                    ? sqlite3_bind_zeroblob64(statement, index, 0u)
+                    : sqlite3_bind_blob64(
+                        statement, index, data, static_cast<sqlite3_uint64>(size), SQLITE_TRANSIENT);
+            } else {
+                static const char empty[] = "";
+                const char *text = size == 0u ? empty : static_cast<const char *>(data);
+                rc = sqlite3_bind_text64(
+                    statement, index, text, static_cast<sqlite3_uint64>(size),
+                    SQLITE_TRANSIENT, SQLITE_UTF8);
+            }
+            break;
+        }
+        default:
+            return esdb_detail::fail(
+                database, error, ESDB_ERR_UNSUPPORTED, ESDB_PHASE_EXEC,
+                database->handle, SQLITE_MISMATCH, "unsupported query parameter type");
+    }
+
+    if (rc != SQLITE_OK) {
+        return esdb_detail::fail(
+            database, error, esdb_detail::map_sqlite_status(rc), ESDB_PHASE_EXEC,
+            database->handle, rc, nullptr);
+    }
+    return ESDB_OK;
+}
+
+esdb_status esdb_query_column_value(
+    esdb_database *database,
+    sqlite3_stmt *statement,
+    int column,
+    esdb_value **out_value,
+    esdb_error *error) noexcept {
+    if (!out_value) {
+        return esdb_detail::fail(
+            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_EXEC,
+            database ? database->handle : nullptr, SQLITE_MISUSE,
+            "query row output value is required");
+    }
+    *out_value = nullptr;
+
+    esdb_error value_error{};
+    esdb_status status = ESDB_ERR_INTERNAL;
+    switch (sqlite3_column_type(statement, column)) {
+        case SQLITE_NULL:
+            status = esdb_value_create_null(out_value, &value_error);
+            break;
+        case SQLITE_INTEGER:
+            status = esdb_value_create_int64(
+                static_cast<std::int64_t>(sqlite3_column_int64(statement, column)),
+                out_value, &value_error);
+            break;
+        case SQLITE_FLOAT:
+            status = esdb_value_create_double(
+                sqlite3_column_double(statement, column), out_value, &value_error);
+            break;
+        case SQLITE_TEXT: {
+            const unsigned char *text = sqlite3_column_text(statement, column);
+            const int bytes = sqlite3_column_bytes(statement, column);
+            if (!text && bytes > 0) {
+                return esdb_detail::fail(
+                    database, error, ESDB_ERR_OUT_OF_MEMORY, ESDB_PHASE_EXEC,
+                    database->handle, SQLITE_NOMEM, "SQLite could not materialize TEXT column");
+            }
+            status = esdb_value_create_text(
+                ESDB_VALUE_UTF8,
+                bytes == 0 ? "" : reinterpret_cast<const char *>(text),
+                static_cast<std::uint64_t>(bytes),
+                out_value,
+                &value_error);
+            break;
+        }
+        case SQLITE_BLOB: {
+            const void *blob = sqlite3_column_blob(statement, column);
+            const int bytes = sqlite3_column_bytes(statement, column);
+            if (!blob && bytes > 0) {
+                return esdb_detail::fail(
+                    database, error, ESDB_ERR_OUT_OF_MEMORY, ESDB_PHASE_EXEC,
+                    database->handle, SQLITE_NOMEM, "SQLite could not materialize BLOB column");
+            }
+            status = esdb_value_create_bytes(
+                blob, static_cast<std::uint64_t>(bytes), out_value, &value_error);
+            break;
+        }
+        default:
+            status = ESDB_ERR_INTERNAL;
+            break;
+    }
+
+    if (status != ESDB_OK) {
+        const int sqlite_code =
+            status == ESDB_ERR_OUT_OF_MEMORY ? SQLITE_NOMEM :
+            status == ESDB_ERR_INVALID_ARGUMENT ? SQLITE_MISMATCH : SQLITE_ERROR;
+        return esdb_detail::fail(
+            database, error, status, ESDB_PHASE_EXEC, database->handle, sqlite_code,
+            value_error.message[0] ? value_error.message : "failed to decode query result column");
+    }
+    return ESDB_OK;
+}
+
+void esdb_query_sync_transaction_state(esdb_database *database) noexcept {
+    if (!database || !database->handle) return;
+    std::lock_guard<esdb_detail::NoThrowMutex> lock(database->state_mutex);
+    database->transaction_active = sqlite3_get_autocommit(database->handle) == 0;
+    if (!database->transaction_active) {
+        database->savepoint_depth = 0u;
+        if (database->active_transaction) {
+            database->active_transaction->active = false;
+            database->active_transaction = nullptr;
+        }
+    }
+}
+
+}  // namespace
+
+esdb_status esdb_query(
+    esdb_database *database,
+    const char *sql_utf8,
+    const esdb_value *const *parameters,
+    uint32_t parameter_count,
+    esdb_query_row_callback callback,
+    void *user_data,
+    uint64_t *out_row_count,
+    uint64_t *out_change_count,
+    esdb_error *error) {
+    esdb_detail::count_operation(database);
+    esdb_detail::clear_error(error);
+    if (out_row_count) *out_row_count = 0u;
+    if (out_change_count) *out_change_count = 0u;
+
+    if (!database || !database->handle || !sql_utf8 || !sql_utf8[0] ||
+        !esdb_detail::valid_utf8(
+            sql_utf8, static_cast<std::uint64_t>(std::strlen(sql_utf8))) ||
+        (parameter_count != 0u && !parameters) ||
+        parameter_count > static_cast<uint32_t>(INT_MAX)) {
+        return esdb_detail::fail(
+            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_EXEC,
+            database ? database->handle : nullptr, SQLITE_MISUSE,
+            "invalid query arguments");
+    }
+
+    QueryStatementGuard statement_guard;
+    const char *tail = nullptr;
+    int rc = sqlite3_prepare_v3(
+        database->handle,
+        sql_utf8,
+        -1,
+        SQLITE_PREPARE_PERSISTENT,
+        &statement_guard.statement,
+        &tail);
+    if (rc != SQLITE_OK) {
+        return esdb_detail::fail(
+            database, error, esdb_detail::map_sqlite_status(rc), ESDB_PHASE_EXEC,
+            database->handle, rc, nullptr);
+    }
+    sqlite3_stmt *statement = statement_guard.statement;
+    if (!statement || !esdb_query_tail_is_empty(tail)) {
+        return esdb_detail::fail(
+            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_EXEC,
+            database->handle, SQLITE_MISUSE,
+            "esdb_query accepts exactly one SQL statement");
+    }
+
+    const int expected_parameters = sqlite3_bind_parameter_count(statement);
+    if (expected_parameters != static_cast<int>(parameter_count)) {
+        return esdb_detail::fail(
+            database, error, ESDB_ERR_INVALID_ARGUMENT, ESDB_PHASE_EXEC,
+            database->handle, SQLITE_RANGE,
+            "query parameter count does not match SQL placeholders");
+    }
+
+    for (uint32_t i = 0u; i < parameter_count; ++i) {
+        const esdb_status bound = esdb_query_bind_value(
+            database, statement, static_cast<int>(i + 1u), parameters[i], error);
+        if (bound != ESDB_OK) {
+            return bound;
+        }
+    }
+
+    const bool readonly = sqlite3_stmt_readonly(statement) != 0;
+    std::uint64_t rows = 0u;
+    bool deliver_rows = callback != nullptr;
+    esdb_status status = ESDB_OK;
+
+    try {
+        const int column_count_i = sqlite3_column_count(statement);
+        const uint32_t column_count =
+            column_count_i > 0 ? static_cast<uint32_t>(column_count_i) : 0u;
+        std::vector<const char *> column_names(column_count);
+        QueryOwnedValueGuard owned_values;
+        owned_values.values.resize(column_count, nullptr);
+        std::vector<const esdb_value *> borrowed_values(column_count, nullptr);
+
+        for (uint32_t column = 0u; column < column_count; ++column) {
+            column_names[column] = sqlite3_column_name(statement, static_cast<int>(column));
+        }
+
+        for (;;) {
+            rc = sqlite3_step(statement);
+            if (rc == SQLITE_DONE) break;
+            if (rc != SQLITE_ROW) {
+                status = esdb_detail::fail(
+                    database, error, esdb_detail::map_sqlite_status(rc), ESDB_PHASE_EXEC,
+                    database->handle, rc, nullptr);
+                break;
+            }
+
+            ++rows;
+            if (!deliver_rows) continue;
+
+            bool row_ok = true;
+            for (uint32_t column = 0u; column < column_count; ++column) {
+                esdb_value_destroy(owned_values.values[column]);
+                owned_values.values[column] = nullptr;
+                borrowed_values[column] = nullptr;
+                const esdb_status decoded = esdb_query_column_value(
+                    database, statement, static_cast<int>(column),
+                    &owned_values.values[column], error);
+                if (decoded != ESDB_OK) {
+                    status = decoded;
+                    row_ok = false;
+                    break;
+                }
+                borrowed_values[column] = owned_values.values[column];
+            }
+            if (!row_ok) break;
+
+            if (callback(
+                    column_names.empty() ? nullptr : column_names.data(),
+                    borrowed_values.empty() ? nullptr : borrowed_values.data(),
+                    column_count,
+                    user_data) != 0) {
+                deliver_rows = false;
+            }
+        }
+
+    } catch (const std::bad_alloc &) {
+        status = esdb_detail::fail(
+            database, error, ESDB_ERR_OUT_OF_MEMORY, ESDB_PHASE_EXEC,
+            database->handle, SQLITE_NOMEM, "query row allocation failed");
+    } catch (...) {
+        status = esdb_detail::fail(
+            database, error, ESDB_ERR_INTERNAL, ESDB_PHASE_EXEC,
+            database->handle, SQLITE_ERROR, "unexpected exception while executing query");
+    }
+
+    if (status == ESDB_OK) {
+        if (out_row_count) *out_row_count = rows;
+        if (out_change_count && !readonly) {
+            const sqlite3_int64 changes = sqlite3_changes64(database->handle);
+            *out_change_count = changes > 0 ? static_cast<std::uint64_t>(changes) : 0u;
+        }
+    }
+
+    statement_guard.finalize();
+    esdb_query_sync_transaction_state(database);
     return status;
 }
 
@@ -1321,6 +1838,20 @@ esdb_status esdb_database_health_get(esdb_database *database, esdb_database_heal
     if (status != ESDB_OK) return status;
     out_health->synchronous = parse_synchronous(synchronous);
 
+    out_health->storage_mode = database->options.storage_mode;
+    out_health->storage_provider =
+        database->options.storage_mode == ESDB_STORAGE_COMPRESSED
+            ? ESDB_PROVIDER_ZIPVFS
+            : ESDB_PROVIDER_SQLITE;
+    out_health->compression_codec =
+        database->options.storage_mode == ESDB_STORAGE_COMPRESSED
+            ? database->options.compression_codec
+            : ESDB_CODEC_NONE;
+    out_health->compression_level =
+        database->options.storage_mode == ESDB_STORAGE_COMPRESSED
+            ? database->options.compression_level
+            : 0;
+
     std::int64_t busy_timeout = 0;
     status = esdb_detail::query_i64(database, "PRAGMA busy_timeout;", &busy_timeout, ESDB_PHASE_HEALTH, error);
     if (status != ESDB_OK) return status;
@@ -1331,7 +1862,13 @@ esdb_status esdb_database_health_get(esdb_database *database, esdb_database_heal
 
     {
         esdb_detail::Statement statement;
-        status = statement.prepare(database, "PRAGMA journal_mode;", ESDB_PHASE_HEALTH, error);
+        status = statement.prepare(
+            database,
+            database->options.storage_mode == ESDB_STORAGE_COMPRESSED
+                ? "PRAGMA zipvfs_journal_mode;"
+                : "PRAGMA journal_mode;",
+            ESDB_PHASE_HEALTH,
+            error);
         if (status != ESDB_OK) return status;
         int step = 0;
         status = statement.step(database, &step, ESDB_PHASE_HEALTH, error);

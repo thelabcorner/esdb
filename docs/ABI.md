@@ -7,7 +7,7 @@ The canonical API is C with opaque handles:
 - esdb_database
 - esdb_transaction
 - esdb_value
-- esdb_subscription
+- esdb_object_subscription
 
 Public structs use fixed-width fields and struct_size where forward-compatible extension is expected.
 
@@ -70,7 +70,42 @@ A native consumer may cast:
 sqlite3 *sql = (sqlite3 *)esdb_native_handle(db);
 ~~~
 
-The escape hatch is intended for product-owned prepared statements and SQLite APIs not wrapped by Runtime, not as a reason to bypass ESDB lifecycle policy.
+Consumers must call SQLite through the **same SQLite image that owns the
+handle**. Link `ESDB::esdb`; do not separately link another SQLite build.
+On POSIX the pinned SQLite public symbols are visible from the ESDB shared
+core. On Windows, `ESDBCore.dll` explicitly exports the pinned SQLite public
+API so its import library resolves those calls as well. This is validated by
+the installed-package C and C++ consumers.
+
+The native-handle escape hatch is intended for product-owned prepared statements and SQLite APIs not wrapped by Runtime, not as a reason to bypass ESDB lifecycle policy.
+
+## Typed SQL query escape hatch
+
+`esdb_query()` is the stable C Runtime's bounded, typed single-statement SQL
+surface. It is separate from `esdb_native_handle()`: callers supply SQL text
+plus an immutable array of `esdb_value*` parameters, and Runtime performs
+prepare/bind/step/finalize on the ESDB-owned SQLite connection.
+
+Contract:
+
+- exactly one SQLite statement is accepted from valid UTF-8 SQL text; a second
+  statement/non-whitespace tail is rejected;
+- the parameter count must exactly match SQLite's positional placeholders;
+- caller values are always bound, never interpolated into SQL text;
+- NULL/BOOL/INT32/INT64/DOUBLE/UTF8/BYTES are bound losslessly when SQLite can
+  represent the value (NaN DOUBLE parameters are rejected); SQLite INTEGER
+  results decode canonically to exact `ESDB_VALUE_INT64`, FLOAT to DOUBLE,
+  TEXT to validated UTF8, BLOB to BYTES, and NULL to NULL;
+- row values are borrowed only during the synchronous callback;
+- a nonzero callback result stops delivery but Runtime continues stepping so
+  `out_row_count` remains the true SQLite row count;
+- mutating statements report `sqlite3_changes64()`;
+- the statement is finalized on success and every failure/exception path, and
+  transaction state is reconciled with ESDB afterward.
+
+This is an **application-query** escape hatch, not migration authority.
+Production schema DDL/diff remains migration-owned (Drizzle Kit for the ESDB
+ORM lane).
 
 ## C++ facade
 
@@ -82,53 +117,67 @@ A Database must outlive child Transaction and Savepoint objects. Public savepoin
 
 ## ExternalObject adapter
 
-The adapter uses ESABI 0.3.1 as the sole host ABI definition.
+The adapter uses ESABI 0.3.1 as the sole host ABI definition and remains a thin transport over the same ESDB Runtime/Store engine. Generated ORM operations stay named/fixed-arity, while the generic ESDB facade also exposes an explicit advanced typed-SQL escape hatch.
 
-Host exports are:
+The exported direct-method families include:
 
-- ESInitialize
-- ESGetVersion
-- ESFreeMem
-- ESTerminate
-- ping
-- abiVersion
-- version
-- sqliteVersion
-- stage
-- openStaged
-- close
-- health
-- lastError
-- dataVersion
-- handleCount
+- lifecycle/identity: `ping`, `abiVersion`, `version`, `sqliteVersion`;
+- database handles: `stage`, `stageHex`, `openStaged`, `close`, `handleCount`;
+- observability: `health`, `lastError`, `dataVersion`;
+- typed SQL: `querySql(handle, sqlHex, parameterPacket, maxRows)`;
+- transactions: `transactionBegin`, `transactionCommit`, `transactionRollback`, `transactionActive`;
+- durable ObjectStore and process-memory Store operation families.
 
-The adapter is intentionally not an SQL transport.
+`querySql` carries SQL UTF-8 bytes (ASCII hex) and a separate typed `P1`
+parameter packet. The native adapter decodes both and delegates to
+`esdb_query()`; it never performs caller-value interpolation. The reply is a
+typed `Q1` packet with column names, returned row count, true total row count,
+change count, truncation flag, and typed row values. Adapter limits are
+1 MiB SQL, 1,024 parameters, 10,000 returned rows, an 8 MiB parameter packet,
+and a 16 MiB encoded result. JSX exposes this as `Database.query()` and
+`Database.run()`.
 
-### Handle safety
+The standard ESABI lifecycle exports (`ESInitialize`, `ESGetVersion`, `ESFreeMem`, `ESTerminate`) are present as well.
+
+### Handle and transaction safety
 
 JS-visible database handles are positive 32-bit generation-tagged tokens. Reusing a slot advances the generation; a stale token no longer resolves to the new database occupying that slot. Generations never wrap: after the finite generation space for one slot is exhausted, that slot is retired for the remainder of the process so an ancient token cannot become valid again through ABA reuse.
 
-The staged-path channel and adapter last-error state are thread-local. The handle table itself is process-global and mutex-protected.
+Each adapter database slot may own at most one explicit `esdb_transaction*`. Closing a slot or terminating the adapter destroys an active transaction first, which rolls it back if necessary. JSX `Database.transaction()` therefore maps to the canonical native transaction surface instead of emulating atomicity in script.
+
+The staged-path channel and adapter last-error state are thread-local. The handle table is process-global and mutex-protected.
 
 The JSX facade treats adapter loading transactionally: constructor/ping failures do not publish a bridge or `loadedSpec`, and a partially created ExternalObject is best-effort unloaded. `ESDB.unload()` refuses to run while database handles remain open. Adobe may still keep the underlying DLL image mapped until the Illustrator process exits, so development iterations should use a fresh DLL path/name rather than assuming the file becomes replaceable.
 
 ### String ownership
 
-Returned strings are allocated with malloc and released through ESFreeMem, which calls the matching free.
+Returned strings are allocated with `malloc` and released through `ESFreeMem`, which calls the matching `free`.
 
-### ES3 wire safety
+### Byte-exact ES3 wire
 
-The ExternalObject string/number surface is not the ESDB native value format.
+The measured Adobe ExternalObject string lane is not a byte-transparent representation of arbitrary ExtendScript text: embedded U+0000 can truncate and surrogate/astral code units are not reliable as raw direct strings. ESDB therefore does **not** use raw host strings as its durable Store wire.
 
-Rules:
+The high-level JSX facade encodes these values to ASCII before crossing the ABI:
 
-- arbitrary INT64 is not converted to JavaScript Number;
-- arbitrary BYTES is not sent as an ExternalObject string;
-- large health counters are serialized as decimal JSON strings;
-- lifecycle/data-version values that fit the adapter's numeric domain use numeric host values;
-- there are no asynchronous callbacks into JSX.
+- database paths through `stageHex`: UTF-8 bytes -> uppercase hex;
+- Store names/keys: UTF-8 bytes -> hex;
+- UTF8/ARRAY/OBJECT Store values: UTF-8 bytes -> hex;
+- BYTES: octets -> hex;
+- INT64 and Store revisions/counts: canonical decimal strings;
+- DOUBLE: Store's numeric lane is binary64; encoded query/result packets use an
+  exact `max_digits10` decimal token, including explicit `Infinity`,
+  `-Infinity`, and `-0` handling; a NaN query parameter is rejected rather than
+  silently becoming SQLite `NULL`;
+- typed SQL parameters use `P1` records and typed SQL results use `Q1` rows;
+  SQL text is a separate UTF-8-hex argument and never contains encoded values.
 
-The future Store adapter should use explicit lossless encodings for INT64 and BYTES, and ESON where structured text is appropriate.
+This is deliberately different from the ESDB native value representation. The adapter is a lossless bridge, not the storage format.
+
+`storeGet` uses `V1:<type>:<payload>`. Missing keys use `V1:-1:`. Change windows use an ASCII-only `V1:<lastRevision>:<count>` header followed by revision/operation/value-type/store-hex/key-hex records.
+
+ARRAY/OBJECT parsing is not implemented inside the native adapter. `extendscript/esdb.jsx` accepts an explicit structured codec and auto-detects ESON when it is already present. ESON is a peer integration, not bundled into the MIT-licensed ESDB distribution.
+
+There are no asynchronous callbacks into JSX. Reactive behavior is host-driven polling over the durable change journal.
 
 ## Expected application failures
 

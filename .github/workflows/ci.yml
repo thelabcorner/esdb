@@ -39,6 +39,7 @@ jobs:
         run: |
           ./consumer-build/esdb_package_consumer
           ./consumer-build/esdb_package_consumer_c
+          ./consumer-build/esdb_package_consumer_orm
 
       - name: Configure embedded Runtime consumer
         run: cmake -S tests/embed_consumer -B embed-build -DCMAKE_BUILD_TYPE=Release
@@ -49,8 +50,151 @@ jobs:
       - name: Run embedded Runtime consumer
         run: ./embed-build/esdb_embed_consumer
 
+  orm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22.23.3"
+          cache: npm
+          cache-dependency-path: |
+            orm/drizzle/package-lock.json
+            examples/orm/user/package-lock.json
+
+      - name: Install pinned ORM dependencies
+        run: |
+          npm ci --prefix orm/drizzle
+          npm ci --prefix examples/orm/user
+
+      - name: Checkout pinned ESABI for bridge validation
+        run: |
+          git clone --no-checkout https://github.com/thelabcorner/esabi.git ../esabi
+          git -C ../esabi fetch --depth=1 origin 400fefa14c1c09c0e51555f8e834975bdddbdb1d
+          git -C ../esabi checkout --detach FETCH_HEAD
+          test "$(git -C ../esabi rev-parse HEAD)" = "400fefa14c1c09c0e51555f8e834975bdddbdb1d"
+
+      - name: Checkout pinned ESTC for ES3 validation
+        run: |
+          git clone --no-checkout https://github.com/thelabcorner/estc.git ../estc
+          git -C ../estc fetch --depth=1 origin 37f94067a76660d145b64c8e2676d72c9a08fb29
+          git -C ../estc checkout --detach FETCH_HEAD
+          test "$(git -C ../estc rev-parse HEAD)" = "37f94067a76660d145b64c8e2676d72c9a08fb29"
+          npm ci --prefix ../estc
+
+      - name: Verify toolchain
+        run: |
+          node --version
+          npm --version
+          command -v clang
+          command -v clang++
+          clang++ --version
+
+      - name: Type-check Drizzle frontend
+        run: npm run check --prefix orm/drizzle
+
+      - name: ORM compiler and wire tests
+        run: node tests/orm/run.mjs
+
+      - name: Verify checked-in ORM artifacts
+        run: |
+          node tools/esdb-schema/bin/esdb-schema.mjs hash examples/orm/user/generated/user.ir.json --check
+          node tools/esdb-schema/bin/esdb-schema.mjs generate examples/orm/user/generated/user.ir.json --out examples/orm/user/generated --check
+          node tools/esdb-schema/bin/esdb-schema.mjs package-migrations examples/orm/user/generated/user.ir.json --kit-dir examples/orm/user/drizzle-migrations --out examples/orm/user/generated --kit-version 0.31.11 --check
+          npm run check --prefix examples/orm/user
+
+      - name: ESTC static ES3 gate
+        run: node ../estc/bin/estc.mjs check examples/orm/user/generated/es3/user_repository.jsx --no-target --json
+
+      - name: Compile generated C++ and ESABI bridge as C++11
+        run: |
+          clang++ -fsyntax-only -std=c++11 -Wall -Wextra -Werror -I include -I third_party/sqlite examples/orm/user/generated/cpp/user_repository.hpp
+          clang++ -fsyntax-only -std=c++11 -Wall -Wextra -Werror -I include -I third_party/sqlite examples/orm/user/generated/migrations/user_migrations.hpp
+          clang++ -fsyntax-only -std=c++11 -Wall -Wextra -Werror -I include -I third_party/sqlite -I ../esabi/include examples/orm/user/bridge/user_orm_bridge.cpp
+          clang -fsyntax-only -std=c11 -Wall -Wextra -Werror -I ../esabi/include -I examples/orm/user/generated/bridge examples/orm/user/generated/bridge/user_orm_bridge_stub.c
+
+      - name: Build native ORM and concrete ESABI bridge smokes
+        run: |
+          cmake -S examples/orm/user -B orm-native -DCMAKE_BUILD_TYPE=Release
+          cmake --build orm-native --target esdb_orm_user_smoke esdb_orm_user_bridge_smoke --parallel
+
+      - name: Run native ORM smokes
+        run: |
+          ./orm-native/esdb_orm_user_smoke ./orm-native/user-smoke.sqlite
+          ./orm-native/esdb_orm_user_bridge_smoke
+
+      - name: Build and execute ORM benchmark harness
+        run: |
+          cmake -S . -B build-orm-bench \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DESDB_BUILD_BENCHMARKS=ON \
+            -DESDB_BUILD_TESTS=OFF \
+            -DESDB_BUILD_EXTERNALOBJECT=OFF \
+            -DESDB_INSTALL=OFF
+          cmake --build build-orm-bench --target esdb_orm_bench_generated esdb_orm_bench_handwritten --parallel
+          node bench/run-orm-bench.mjs --build-dir build-orm-bench --repeats 9 --json-only
+
+  orm-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22.23.3"
+          cache: npm
+          cache-dependency-path: |
+            orm/drizzle/package-lock.json
+            examples/orm/user/package-lock.json
+
+      - name: Install pinned ORM dependencies
+        run: |
+          npm ci --prefix orm/drizzle
+          npm ci --prefix examples/orm/user
+
+      - name: Checkout pinned ESABI for bridge validation
+        shell: pwsh
+        run: |
+          git clone --no-checkout https://github.com/thelabcorner/esabi.git ../esabi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C ../esabi fetch --depth=1 origin 400fefa14c1c09c0e51555f8e834975bdddbdb1d
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C ../esabi checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $head = (git -C ../esabi rev-parse HEAD).Trim()
+          if ($head -ne "400fefa14c1c09c0e51555f8e834975bdddbdb1d") {
+            throw "unexpected ESABI revision: $head"
+          }
+
+      - name: Type-check and test ORM compiler
+        shell: pwsh
+        run: |
+          npm run check --prefix orm/drizzle
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node tests/orm/run.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run check --prefix examples/orm/user
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build native ORM and concrete ESABI bridge smokes
+        shell: pwsh
+        run: |
+          cmake -S examples/orm/user -B orm-native -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build orm-native --config Release --target esdb_orm_user_smoke esdb_orm_user_bridge_smoke --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run native ORM smokes
+        shell: pwsh
+        run: |
+          & ./orm-native/Release/esdb_orm_user_smoke.exe ./orm-native/user-smoke.sqlite
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./orm-native/Release/esdb_orm_user_bridge_smoke.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
   windows:
-    runs-on: windows-2022
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
 
@@ -69,12 +213,7 @@ jobs:
 
       - name: Verify ExternalObject exports
         shell: pwsh
-        run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          $toolset = Get-ChildItem -LiteralPath "$vsPath\VC\Tools\MSVC" -Directory | Sort-Object Name -Descending | Select-Object -First 1
-          $env:PATH = "$($toolset.FullName)\bin\Hostx64\x64;$env:PATH"
-          ./tools/verify-externalobject-exports.ps1 -Dll ./build/Release/ESDB.dll
+        run: ./tools/verify-externalobject-exports.ps1 -Dll ./build/Release/ESDB.dll
 
       - name: Install
         run: cmake --install build --config Release --prefix "${{ github.workspace }}/install"
@@ -88,6 +227,15 @@ jobs:
       - name: Build installed-package consumer
         run: cmake --build consumer-build --config Release --parallel
 
+      - name: Add installed ESDB runtime to DLL search path
+        shell: pwsh
+        run: |
+          $runtimePath = Join-Path $PWD "install\bin"
+          if (-not (Test-Path -LiteralPath (Join-Path $runtimePath "ESDBCore.dll"))) {
+            throw "Installed ESDBCore.dll not found: $runtimePath"
+          }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $runtimePath
+
       - name: Run installed-package consumers
         shell: pwsh
         run: |
@@ -95,12 +243,23 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & ./consumer-build/Release/esdb_package_consumer_c.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./consumer-build/Release/esdb_package_consumer_orm.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Configure embedded Runtime consumer
         run: cmake -S tests/embed_consumer -B embed-build -G "Visual Studio 17 2022" -A x64
 
       - name: Build embedded Runtime consumer
         run: cmake --build embed-build --config Release --parallel
+
+      - name: Add embedded ESDB runtime to DLL search path
+        shell: pwsh
+        run: |
+          $runtimePath = Join-Path $PWD "embed-build\esdb-dependency\Release"
+          if (-not (Test-Path -LiteralPath (Join-Path $runtimePath "ESDBCore.dll"))) {
+            throw "Embedded ESDBCore.dll not found: $runtimePath"
+          }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $runtimePath
 
       - name: Run embedded Runtime consumer
         shell: pwsh
@@ -113,8 +272,7 @@ jobs:
         run: |
           cpack --config build/CPackConfig.cmake -C Release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $package = Get-ChildItem -LiteralPath . -Filter "ESDB-*.zip" | Select-Object -First 1
-          if (-not $package) { throw "CPack ZIP was not generated in the repository root" }
+          $package = Get-ChildItem -LiteralPath . -Filter "ESDB-*.zip" | Select-Object -Single
           $first = (Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash
           Start-Sleep -Seconds 2
           cpack --config build/CPackConfig.cmake -C Release

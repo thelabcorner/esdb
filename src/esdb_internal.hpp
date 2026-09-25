@@ -2,7 +2,7 @@
 #define ESDB_INTERNAL_HPP
 
 #include <esdb/esdb.h>
-#include <esdb/esdb_store.h>
+#include <esdb/esdb_object_store.h>
 
 #include "esdb_nothrow_mutex.hpp"
 #include <sqlite3.h>
@@ -22,13 +22,13 @@ struct esdb_database {
     sqlite3 *handle = nullptr;
     esdb_detail::NoThrowMutex state_mutex;
     esdb_detail::NoThrowMutex error_mutex;
-    esdb_detail::NoThrowMutex store_schema_mutex;
-    esdb_detail::NoThrowMutex store_write_mutex;
+    esdb_detail::NoThrowMutex object_store_schema_mutex;
+    esdb_detail::NoThrowMutex object_store_write_mutex;
     bool transaction_active = false;
     esdb_transaction *active_transaction = nullptr;
     std::array<std::array<char, ESDB_SAVEPOINT_NAME_MAX_BYTES + 1u>, 64u> savepoints{};
     std::uint32_t savepoint_depth = 0u;
-    bool store_schema_ready = false;
+    bool object_store_schema_ready = false;
     esdb_open_options options{};
     std::atomic<std::uint64_t> operation_count{0};
     std::atomic<std::uint64_t> error_count{0};
@@ -48,9 +48,9 @@ struct esdb_value {
     std::vector<std::uint8_t> payload;
 };
 
-struct esdb_subscription {
+struct esdb_object_subscription {
     esdb_database *database = nullptr;
-    char store_name[ESDB_STORE_NAME_MAX_BYTES + 1u]{};
+    char store_name[ESDB_OBJECT_STORE_NAME_MAX_BYTES + 1u]{};
     bool all_stores = true;
     std::atomic<std::uint64_t> revision{0u};
     esdb_detail::NoThrowMutex poll_mutex;
@@ -135,20 +135,35 @@ private:
 
 bool valid_utf8(const char *text, std::uint64_t size) noexcept;
 bool valid_c_string(const char *text, std::size_t max_bytes) noexcept;
-bool valid_store_name(const char *text) noexcept;
-bool valid_store_key(const char *text) noexcept;
+bool valid_object_store_name(const char *text) noexcept;
+bool valid_object_store_key(const char *text) noexcept;
 bool valid_savepoint_name(const char *text) noexcept;
 std::int64_t unix_time_ms() noexcept;
 
-/* ---- Store internals ---- */
+/* ---- optional physical storage providers ---- */
 
-esdb_status ensure_store_schema(esdb_database *database, esdb_error *error) noexcept;
-esdb_status store_changes_since_impl(
+bool zipvfs_compiled() noexcept;
+bool zipvfs_zstd_compiled() noexcept;
+
+esdb_status storage_vfs_select(
+    const esdb_open_options &options,
+    const char **out_vfs_name,
+    esdb_error *error) noexcept;
+
+esdb_status storage_verify_open(
+    sqlite3 *database,
+    const esdb_open_options &options,
+    esdb_error *error) noexcept;
+
+/* ---- ObjectStore internals ---- */
+
+esdb_status ensure_object_store_schema(esdb_database *database, esdb_error *error) noexcept;
+esdb_status object_store_changes_since_impl(
     esdb_database *database,
     const char *store_name_or_null,
     std::uint64_t after_revision,
     std::uint32_t limit,
-    esdb_change_callback callback,
+    esdb_object_change_callback callback,
     void *user_data,
     std::uint64_t *out_last_revision,
     std::uint32_t *out_change_count,

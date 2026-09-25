@@ -68,6 +68,28 @@ enum {
     ESDB_SYNCHRONOUS_EXTRA = 4u
 };
 
+/* Runtime storage selection. Plain SQLite remains the reference backend. */
+typedef uint32_t esdb_storage_mode;
+enum {
+    ESDB_STORAGE_DEFAULT = 0u,     /* current build default; plain in public ESDB */
+    ESDB_STORAGE_PLAIN = 1u,       /* require stock SQLite storage */
+    ESDB_STORAGE_COMPRESSED = 2u   /* require a compression-capable provider */
+};
+
+typedef uint32_t esdb_storage_provider;
+enum {
+    ESDB_PROVIDER_AUTO = 0u,
+    ESDB_PROVIDER_SQLITE = 1u,
+    ESDB_PROVIDER_ZIPVFS = 2u
+};
+
+typedef uint32_t esdb_codec;
+enum {
+    ESDB_CODEC_NONE = 0u,
+    ESDB_CODEC_ZSTD = 1u,
+    ESDB_CODEC_DEFLATE = 2u
+};
+
 typedef struct esdb_open_options {
     uint32_t struct_size;
     esdb_open_flags flags;
@@ -77,7 +99,11 @@ typedef struct esdb_open_options {
     uint32_t cache_kib;
     uint32_t wal_autocheckpoint_pages;
     uint32_t foreign_keys;
-    uint32_t reserved[4];
+    esdb_storage_mode storage_mode;
+    esdb_storage_provider storage_provider;
+    esdb_codec compression_codec;
+    int32_t compression_level;
+    uint32_t reserved[2];
 } esdb_open_options;
 
 /* Fills `options` with the documented defaults. Never fails. */
@@ -88,18 +114,11 @@ ESDB_API void esdb_open_options_init(esdb_open_options *options);
  * Callers must zero-initialize the struct or set struct_size=sizeof(struct)
  * before calling esdb_backend_capabilities_get().
  *
- * Compression metadata is a placeholder contract: compression_supported is 0
- * and page_codec is ESDB_CODEC_NONE in v0.1. The fields exist so a future
- * storage provider can describe itself without an ABI break, and so callers
- * can assert "plain SQLite" rather than assume it.
+ * Compression fields describe the selected provider's physical storage. The
+ * public build currently advertises plain SQLite only; a compressed request is
+ * rejected rather than silently falling back. Licensed ZIPVFS and future open
+ * providers plug in beneath this contract.
  */
-typedef uint32_t esdb_codec;
-enum {
-    ESDB_CODEC_NONE = 0u,
-    ESDB_CODEC_ZSTD = 1u,     /* reserved: no shipped backend uses it in v0.1 */
-    ESDB_CODEC_DEFLATE = 2u   /* reserved: no shipped backend uses it in v0.1 */
-};
-
 typedef struct esdb_backend_capabilities {
     uint32_t struct_size;
     char backend_id[ESDB_BACKEND_ID_CAPACITY];
@@ -138,6 +157,10 @@ typedef struct esdb_database_health {
     int64_t configured_cache_kib;
     esdb_journal_mode journal_mode;
     esdb_synchronous_mode synchronous;
+    esdb_storage_mode storage_mode;
+    esdb_storage_provider storage_provider;
+    esdb_codec compression_codec;
+    int32_t compression_level;
     uint32_t busy_timeout_ms;
     uint32_t user_version;
     uint32_t in_transaction;
@@ -194,10 +217,49 @@ ESDB_API void *esdb_native_handle(esdb_database *database);
 ESDB_API esdb_status esdb_exec(esdb_database *database, const char *sql_utf8, esdb_error *error);
 
 /*
+ * Typed single-statement SQL escape hatch.
+ *
+ * sql_utf8 is prepared as exactly one SQLite statement. Parameters are bound
+ * positionally (1..parameter_count) from immutable esdb_value objects; caller
+ * values are never interpolated into SQL text. The supplied parameter count
+ * must exactly match sqlite3_bind_parameter_count().
+ *
+ * Row values are borrowed only for the duration of callback. SQLite storage
+ * classes map canonically to ESDB values:
+ *   NULL -> NULL, INTEGER -> INT64, FLOAT -> DOUBLE,
+ *   TEXT -> UTF8 (invalid UTF-8 is rejected), BLOB -> BYTES.
+ * A non-zero callback result stops row delivery successfully.
+ *
+ * out_row_count counts rows produced by SQLite (even after callback asks to stop
+ * delivery). out_change_count is zero for read-only
+ * statements and sqlite3_changes64() for mutating statements.
+ *
+ * This is an application-query escape hatch, not a schema-authoring surface:
+ * production DDL/diff authority remains with the application's migration
+ * system (Drizzle Kit for ESDB ORM).
+ */
+typedef int (*esdb_query_row_callback)(
+    const char *const *column_names,
+    const esdb_value *const *values,
+    uint32_t column_count,
+    void *user_data);
+
+ESDB_API esdb_status esdb_query(
+    esdb_database *database,
+    const char *sql_utf8,
+    const esdb_value *const *parameters,
+    uint32_t parameter_count,
+    esdb_query_row_callback callback,
+    void *user_data,
+    uint64_t *out_row_count,
+    uint64_t *out_change_count,
+    esdb_error *error);
+
+/*
  * PRAGMA data_version: a per-connection counter that changes when another
  * connection commits a change to the database. This is the polling primitive
  * a future reactive Store builds on; it does not change for this connection's
- * own writes (use esdb_store_revision() for those).
+ * own writes (use esdb_object_store_revision() for those).
  */
 ESDB_API esdb_status esdb_data_version_get(
     esdb_database *database,

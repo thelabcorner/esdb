@@ -1,1 +1,1 @@
-third_party/sqlite/** -whitespace text eol=lf
+third_party/sqlite/** -whitespace
