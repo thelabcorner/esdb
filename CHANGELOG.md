@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.1 - Unreleased
+
+Runtime contract hardening for downstream production consumers.
+
+### Runtime
+
+- Made WAL autocheckpoint configuration unambiguous: `ESDB_WAL_AUTOCHECKPOINT_UNCHANGED` preserves SQLite's connection default, `0` explicitly disables automatic WAL checkpoints, and positive values set an exact page threshold.
+- Kept the `esdb_open_options` binary layout unchanged while advancing the Runtime ABI contract to 3 because a public field's semantics changed.
+- Added Runtime smoke coverage for unchanged/default, disabled, and explicit WAL-autocheckpoint thresholds.
+
+### Packaging and qualification
+
+- The installed-package consumer now requests the ESDB 0.2 compatibility line rather than the stale 0.1 line.
+- 0.2.1 is the qualification target for downstream consumers that require the explicit WAL-autocheckpoint contract.
+
 ## 0.2.0 - 2026-09-25
 
 Initial ESDB foundation.
