@@ -231,7 +231,8 @@ static int capture_single_int64(
     void *user) {
     if (!values || count != 1u || !values[0] || !user) return 1;
     auto *out = static_cast<int64_t *>(user);
-    return esdb_value_get_int64(values[0], out) == ESDB_OK ? 1 : 1;
+    CHECK(esdb_value_get_int64(values[0], out) == ESDB_OK);
+    return 1;
 }
 
 static int64_t query_single_int64(esdb_database *db, const char *sql, esdb_error *error) {
