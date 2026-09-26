@@ -20,15 +20,15 @@ extern "C" {
 
 #define ESDB_VERSION_MAJOR 0u
 #define ESDB_VERSION_MINOR 2u
-#define ESDB_VERSION_PATCH 0u
-#define ESDB_VERSION_STRING "0.2.0"
+#define ESDB_VERSION_PATCH 1u
+#define ESDB_VERSION_STRING "0.2.1"
 
 /*
  * ESDB_ABI_VERSION tracks the binary contract, not the product version. It is
  * incremented when the layout of a public struct, the meaning of a public
  * enum value, or the signature of a public function changes.
  */
-#define ESDB_ABI_VERSION 2u
+#define ESDB_ABI_VERSION 3u
 
 #define ESDB_ERROR_MESSAGE_CAPACITY 256u
 #define ESDB_BACKEND_ID_CAPACITY 32u
