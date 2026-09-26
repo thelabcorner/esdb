@@ -90,6 +90,17 @@ enum {
     ESDB_CODEC_DEFLATE = 2u
 };
 
+/*
+ * WAL autocheckpoint policy:
+ *   ESDB_WAL_AUTOCHECKPOINT_UNCHANGED -> preserve SQLite's connection default
+ *   0                                  -> disable automatic WAL checkpoints
+ *   N > 0                              -> checkpoint automatically after N pages
+ *
+ * The sentinel keeps "unchanged" distinct from SQLite's meaningful zero value
+ * without changing the ABI layout of esdb_open_options.
+ */
+#define ESDB_WAL_AUTOCHECKPOINT_UNCHANGED UINT32_MAX
+
 typedef struct esdb_open_options {
     uint32_t struct_size;
     esdb_open_flags flags;
