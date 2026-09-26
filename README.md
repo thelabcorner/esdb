@@ -102,7 +102,7 @@ ESDB is **not** "SQLite exposed to ExtendScript." SQLite is the durable kernel; 
 
 ## Status
 
-0.2.0 builds on the 0.1.0 foundation. It currently includes:
+0.2.1 builds on the 0.2.0 foundation. It currently includes:
 
 - pinned, vendored SQLite 3.53.4 with configure-time SHA-256 pin verification;
 - stable opaque-handle C ABI and a move-only C++11+ RAII facade;
