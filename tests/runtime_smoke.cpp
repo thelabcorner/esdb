@@ -224,17 +224,70 @@ static int throwing_query_row(
     throw std::runtime_error("intentional query callback fault");
 }
 
+static int capture_single_int64(
+    const char *const *,
+    const esdb_value *const *values,
+    uint32_t count,
+    void *user) {
+    if (!values || count != 1u || !values[0] || !user) return 1;
+    auto *out = static_cast<int64_t *>(user);
+    return esdb_value_get_int64(values[0], out) == ESDB_OK ? 1 : 1;
+}
+
+static int64_t query_single_int64(esdb_database *db, const char *sql, esdb_error *error) {
+    int64_t value = INT64_MIN;
+    uint64_t rows = 0u;
+    const esdb_status status =
+        esdb_query(db, sql, nullptr, 0u, capture_single_int64, &value, &rows, nullptr, error);
+    CHECK(status == ESDB_OK);
+    CHECK(rows == 1u);
+    return value;
+}
+
 int main() {
     const std::string path = "esdb-runtime-smoke.sqlite";
     const std::string backup = "esdb-runtime-smoke.backup.sqlite";
+    const std::string no_auto_path = "esdb-runtime-no-autocheckpoint.sqlite";
+    esdb_open_options no_auto{};
+    esdb_open_options_init(&no_auto);
+    no_auto.journal_mode = ESDB_JOURNAL_WAL;
+    no_auto.wal_autocheckpoint_pages = 0u;
+    esdb_database *no_auto_db = nullptr;
+    CHECK(esdb_open(no_auto_path.c_str(), &no_auto, &no_auto_db, &error) == ESDB_OK);
+    CHECK(no_auto_db != nullptr);
+    if (no_auto_db) {
+        CHECK(query_single_int64(no_auto_db, "PRAGMA wal_autocheckpoint;", &error) == 0);
+        esdb_close(no_auto_db);
+    }
+
+    const std::string threshold_path = "esdb-runtime-autocheckpoint-37.sqlite";
+    esdb_open_options threshold{};
+    esdb_open_options_init(&threshold);
+    threshold.journal_mode = ESDB_JOURNAL_WAL;
+    threshold.wal_autocheckpoint_pages = 37u;
+    esdb_database *threshold_db = nullptr;
+    CHECK(esdb_open(threshold_path.c_str(), &threshold, &threshold_db, &error) == ESDB_OK);
+    CHECK(threshold_db != nullptr);
+    if (threshold_db) {
+        CHECK(query_single_int64(threshold_db, "PRAGMA wal_autocheckpoint;", &error) == 37);
+        esdb_close(threshold_db);
+    }
+
     std::remove(path.c_str());
     std::remove((path + "-wal").c_str());
     std::remove((path + "-shm").c_str());
     std::remove(backup.c_str());
+    std::remove(no_auto_path.c_str());
+    std::remove((no_auto_path + "-wal").c_str());
+    std::remove((no_auto_path + "-shm").c_str());
+    std::remove(threshold_path.c_str());
+    std::remove((threshold_path + "-wal").c_str());
+    std::remove((threshold_path + "-shm").c_str());
 
     esdb_error error{};
     esdb_open_options options{};
     esdb_open_options_init(&options);
+    CHECK(options.wal_autocheckpoint_pages == ESDB_WAL_AUTOCHECKPOINT_UNCHANGED);
     options.journal_mode = ESDB_JOURNAL_WAL;
     options.synchronous = ESDB_SYNCHRONOUS_FULL;
     options.cache_kib = 16384u;
@@ -244,6 +297,7 @@ int main() {
     if (!db) return 1;
     CHECK(std::strcmp(esdb_version(), "0.2.0") == 0);
     CHECK(std::strcmp(esdb_sqlite_version(), "3.53.4") == 0);
+    CHECK(query_single_int64(db, "PRAGMA wal_autocheckpoint;", &error) == 1000);
     CHECK(esdb_integrity_check(db, 1, &error) == ESDB_OK);
 
     esdb_migration migration{0u, 1u, migration_0_to_1, nullptr};
