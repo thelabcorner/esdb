@@ -12,7 +12,7 @@ extern "C" {
  * ESDB Runtime: connection lifecycle, transactions, schema versioning,
  * integrity, backup, and observability over a single native storage engine.
  *
- * The v0.1 engine is stock SQLite 3.53.4, vendored and cryptographically
+ * The v0.2 Runtime engine is stock SQLite 3.53.4, vendored and cryptographically
  * verified from the canonical cmake/sqlite-pin.json release pin, then compiled
  * into the ESDB library. The public header never exposes a sqlite3*
  * type; the controlled escape hatch is esdb_native_handle(), documented in
