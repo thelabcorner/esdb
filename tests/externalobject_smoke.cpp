@@ -175,7 +175,7 @@ int main() {
 
     esabi_value version_result{};
     CHECK(version(&dummy, 1, &version_result) == ESABI_OK);
-    CHECK(take_string(version_result) == "0.2.0");
+    CHECK(take_string(version_result) == "0.2.1");
 
     esabi_value sqlite_result{};
     CHECK(sqliteVersion(&dummy, 1, &sqlite_result) == ESABI_OK);
