@@ -707,7 +707,7 @@ int main() {
     read_only_options.journal_mode = ESDB_JOURNAL_UNCHANGED;
     read_only_options.synchronous = ESDB_SYNCHRONOUS_UNCHANGED;
     read_only_options.cache_kib = 0u;
-    read_only_options.wal_autocheckpoint_pages = 0u;
+    read_only_options.wal_autocheckpoint_pages = ESDB_WAL_AUTOCHECKPOINT_UNCHANGED;
     esdb_database *read_only_db = nullptr;
     CHECK(esdb_open(path.c_str(), &read_only_options, &read_only_db, &error) == ESDB_OK);
     CHECK(read_only_db != nullptr);
