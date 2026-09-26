@@ -77,7 +77,7 @@ These are read from the current tree and are binding on the ORM design.
 
 ### 3.1 Runtime
 
- - Version `0.2.0`, `ESDB_ABI_VERSION 2` (`include/esdb/esdb_types.h`).
+ - Version `0.2.1`, `ESDB_ABI_VERSION 3` (`include/esdb/esdb_types.h`).
 - One SQLite connection per `esdb_database`; `ESDB_OPEN_FULLMUTEX` is the default. `FULLMUTEX` serializes
   individual SQLite calls but does not serialize an application-level `begin -> calls -> commit` sequence
   (`docs/ABI.md`).
