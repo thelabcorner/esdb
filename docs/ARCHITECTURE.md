@@ -113,7 +113,7 @@ For cross-process access, behavior is SQLite's behavior for the selected journal
 
 ## Durability policy
 
-ESDB rejects explicit `journal_mode=MEMORY`, `journal_mode=OFF`, and `synchronous=OFF` requests. Unknown enum values and nonzero reserved option fields are rejected before opening. When a journal/synchronous/cache/WAL-autocheckpoint policy is explicitly requested, ESDB reads the corresponding pragma back and requires SQLite to have applied that exact setting; a backend/path that cannot honor it fails configuration instead of silently degrading it. `UNCHANGED` remains available for callers intentionally inheriting the existing database/backend mode.
+ESDB rejects explicit `journal_mode=MEMORY`, `journal_mode=OFF`, and `synchronous=OFF` requests. Unknown enum values and nonzero reserved option fields are rejected before opening. When a journal/synchronous/cache/WAL-autocheckpoint policy is explicitly requested, ESDB reads the corresponding pragma back and requires SQLite to have applied that exact setting; a backend/path that cannot honor it fails configuration instead of silently degrading it. WAL autocheckpoint uses an explicit three-state contract: `ESDB_WAL_AUTOCHECKPOINT_UNCHANGED` inherits SQLite's connection default, `0` disables automatic checkpoints, and a positive value sets the page threshold. `UNCHANGED` remains available for journal/synchronous callers intentionally inheriting the existing database/backend mode.
 
 Native callers may intentionally bypass policy through the SQLite escape hatch, but health reporting reflects the observed configuration.
 
