@@ -296,7 +296,7 @@ int main() {
     esdb_database *db = nullptr;
     CHECK(esdb_open(path.c_str(), &options, &db, &error) == ESDB_OK);
     if (!db) return 1;
-    CHECK(std::strcmp(esdb_version(), "0.2.0") == 0);
+    CHECK(std::strcmp(esdb_version(), "0.2.1") == 0);
     CHECK(std::strcmp(esdb_sqlite_version(), "3.53.4") == 0);
     CHECK(query_single_int64(db, "PRAGMA wal_autocheckpoint;", &error) == 1000);
     CHECK(esdb_integrity_check(db, 1, &error) == ESDB_OK);
