@@ -460,7 +460,7 @@ void esdb_open_options_init(esdb_open_options *options) {
     options->journal_mode = ESDB_JOURNAL_UNCHANGED;
     options->synchronous = ESDB_SYNCHRONOUS_UNCHANGED;
     options->cache_kib = 0u;
-    options->wal_autocheckpoint_pages = 0u;
+    options->wal_autocheckpoint_pages = ESDB_WAL_AUTOCHECKPOINT_UNCHANGED;
     options->foreign_keys = 1u;
     options->storage_mode = ESDB_STORAGE_DEFAULT;
     options->storage_provider = ESDB_PROVIDER_AUTO;
@@ -790,7 +790,7 @@ static esdb_status configure_database(esdb_database *database, const esdb_open_o
         }
     }
 
-    if (options.wal_autocheckpoint_pages > 0) {
+    if (options.wal_autocheckpoint_pages != ESDB_WAL_AUTOCHECKPOINT_UNCHANGED) {
         char sql[64];
         std::snprintf(sql, sizeof(sql), "PRAGMA wal_autocheckpoint=%u;", options.wal_autocheckpoint_pages);
         status = esdb_detail::exec_sql(database, sql, ESDB_PHASE_CONFIGURE, error);
