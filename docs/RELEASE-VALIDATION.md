@@ -1,6 +1,14 @@
-# ESDB 0.1.0 validation ledger
+# ESDB release validation ledger
 
-This ledger records evidence for the ESDB 0.1.0 release surface across successive validation cuts. It separates native tests, packaging checks, parser validation, and live Illustrator execution so one evidence class is not overstated as another. The original binary fingerprint and its export list below are historical; the current working tree has since added typed raw SQL and additional adapter methods.
+This ledger preserves historical 0.1.0 evidence and records qualification evidence for current releases. Evidence is intentionally separated by native tests, installed-package consumption, parser/toolchain validation, and live Illustrator execution so one class is never overstated as another.
+
+## 0.2.1 qualification target
+
+ESDB 0.2.1 is the current qualification target. It advances the Runtime contract to ABI 3 so WAL autocheckpoint policy is explicit: `ESDB_WAL_AUTOCHECKPOINT_UNCHANGED` preserves SQLite's connection default, zero disables automatic WAL checkpoints, and positive values request an exact page threshold. The installed-package consumer requests the 0.2 compatibility line. A release/tag must not be described as qualified until the cross-platform native, hardening, crash, multiprocess, and installed-package jobs are observed green for the release commit.
+
+## Historical 0.1.0 evidence
+
+The sections below originated with the ESDB 0.1.0 validation surface and are retained as historical evidence. Version strings and binary fingerprints in those sections describe the artifacts tested at that time; they are not claims about the current 0.2.1 build.
 
 ## Environment
 
