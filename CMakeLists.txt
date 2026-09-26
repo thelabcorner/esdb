@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(ESDB VERSION 0.2.0 LANGUAGES C CXX)
+project(ESDB VERSION 0.2.1 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
