@@ -249,6 +249,17 @@ int main() {
     const std::string path = "esdb-runtime-smoke.sqlite";
     const std::string backup = "esdb-runtime-smoke.backup.sqlite";
     const std::string no_auto_path = "esdb-runtime-no-autocheckpoint.sqlite";
+    const std::string threshold_path = "esdb-runtime-autocheckpoint-37.sqlite";
+
+    for (const std::string *database_path : {&path, &no_auto_path, &threshold_path}) {
+        std::remove(database_path->c_str());
+        std::remove((*database_path + "-wal").c_str());
+        std::remove((*database_path + "-shm").c_str());
+    }
+    std::remove(backup.c_str());
+
+    esdb_error error{};
+
     esdb_open_options no_auto{};
     esdb_open_options_init(&no_auto);
     no_auto.journal_mode = ESDB_JOURNAL_WAL;
@@ -261,7 +272,6 @@ int main() {
         esdb_close(no_auto_db);
     }
 
-    const std::string threshold_path = "esdb-runtime-autocheckpoint-37.sqlite";
     esdb_open_options threshold{};
     esdb_open_options_init(&threshold);
     threshold.journal_mode = ESDB_JOURNAL_WAL;
@@ -274,18 +284,6 @@ int main() {
         esdb_close(threshold_db);
     }
 
-    std::remove(path.c_str());
-    std::remove((path + "-wal").c_str());
-    std::remove((path + "-shm").c_str());
-    std::remove(backup.c_str());
-    std::remove(no_auto_path.c_str());
-    std::remove((no_auto_path + "-wal").c_str());
-    std::remove((no_auto_path + "-shm").c_str());
-    std::remove(threshold_path.c_str());
-    std::remove((threshold_path + "-wal").c_str());
-    std::remove((threshold_path + "-shm").c_str());
-
-    esdb_error error{};
     esdb_open_options options{};
     esdb_open_options_init(&options);
     CHECK(options.wal_autocheckpoint_pages == ESDB_WAL_AUTOCHECKPOINT_UNCHANGED);
@@ -685,9 +683,11 @@ int main() {
     CHECK(esdb_integrity_check(backup_db, 1, &error) == ESDB_OK);
     esdb_close(backup_db);
 
-    std::remove(path.c_str());
-    std::remove((path + "-wal").c_str());
-    std::remove((path + "-shm").c_str());
+    for (const std::string *database_path : {&path, &no_auto_path, &threshold_path}) {
+        std::remove(database_path->c_str());
+        std::remove((*database_path + "-wal").c_str());
+        std::remove((*database_path + "-shm").c_str());
+    }
     std::remove(backup.c_str());
 
     if (failures != 0) {
