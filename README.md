@@ -25,58 +25,76 @@
 
 ### Runtime Primitives
 
-**[ESON](https://github.com/thelabcorner/eson)**  
+**[ESON](https://github.com/thelabcorner/eson)**<br />
 Strict RFC 8259 JSON for ExtendScript.
 
-**[ESB64](https://github.com/thelabcorner/es-b64)**  
+**[ESB64](https://github.com/thelabcorner/es-b64)**<br />
 Base64 and UTF-8 utilities.
 
-**[ESARR](https://github.com/thelabcorner/es-arr)**  
+**[ESARR](https://github.com/thelabcorner/es-arr)**<br />
 ES5+ Array compatibility methods.
 
-**[ESSTR](https://github.com/thelabcorner/es-str)**  
+**[ESSTR](https://github.com/thelabcorner/es-str)**<br />
 String whitespace and trim methods.
 
-**[ESCHARS](https://github.com/thelabcorner/es-chars)**  
+**[ESCHARS](https://github.com/thelabcorner/es-chars)**<br />
 Native bulk byte operations.
 
-**[ESHTTP](https://github.com/thelabcorner/es-http)**  
+**[ESHTTP](https://github.com/thelabcorner/es-http)**<br />
 HTTP transport for ExtendScript automation.
 
-**[ESTIMER](https://github.com/thelabcorner/es-timer)**  
+**[ESTIMER](https://github.com/thelabcorner/es-timer)**<br />
 Microsecond timing for ExtendScript automation.
 
-**[ESRAND](https://github.com/thelabcorner/es-rand)**  
+**[ESRAND](https://github.com/thelabcorner/es-rand)**<br />
 Deterministic random streams and sampling for ExtendScript.
 
-**[ESUUID](https://github.com/thelabcorner/es-uuid)**  
+**[ESUUID](https://github.com/thelabcorner/es-uuid)**<br />
 RFC 9562 UUID generation, parsing, and conversion for ExtendScript.
+
+**[ESENV](https://github.com/thelabcorner/es-env)**<br />
+Environment and capability detection for ExtendScript.
+
+**[ESPATH](https://github.com/thelabcorner/es-path)**<br />
+Deterministic Windows/POSIX path and RFC 8089 file-URI transformations.
+
+**[ESFS](https://github.com/thelabcorner/es-fs)**<br />
+Synchronous ExtendScript File/Folder I/O with explicit text, BINARY, and replacement semantics.
+
+**[ESHASH](https://github.com/thelabcorner/es-hash)**<br />
+CRC-32/ISO-HDLC and SHA-256 for byte strings and UTF-8 text.
+
+**[ESLOG](https://github.com/thelabcorner/es-log)**<br />
+Structured logging with bounded text and JSONL sinks.
 
 </td>
 <td width="50%" valign="top">
 
 ### Build & Integration Tools
 
-**[ESPACK](https://github.com/thelabcorner/espack)**  
+**[ESPACK](https://github.com/thelabcorner/espack)**<br />
 Self-extracting ExternalObject bundles.
 
-**[ESMIN](https://github.com/thelabcorner/es-min)**  
+**[ESMIN](https://github.com/thelabcorner/es-min)**<br />
 Minification for shipped JSX bundles.
 
-**[ESABI](https://github.com/thelabcorner/esabi)**  
+**[ESABI](https://github.com/thelabcorner/esabi)**<br />
 Modern ExternalObject ABI declarations for native integrations.
 
-**[VectorIPC](https://github.com/thelabcorner/vector-ipc)**  
+**[VectorIPC](https://github.com/thelabcorner/vector-ipc)**<br />
 Bounded local IPC for scripting hosts and native plug-ins.
 
-**[ESTC](https://github.com/thelabcorner/estc)**  
+**[ESTC](https://github.com/thelabcorner/estc)**<br />
 TypeScript-to-ExtendScript build, compatibility, and live-parse tooling.
 
-**[ESDB](https://github.com/thelabcorner/esdb)**  
+**[ESDB](https://github.com/thelabcorner/esdb)**<br />
 Native state and durable storage for Adobe tooling.
 
-**ESOBF** <sub>coming soon</sub>  
-Obfuscation for hardened JSX distribution.
+**[COMTool](https://github.com/thelabcorner/COMTool)**<br />
+Guarded COM, ExtendScript, plug-in, and debugger automation for Adobe desktop apps.
+
+**[ESsemble](https://github.com/thelabcorner/essemble)**<br />
+Typed framework, resolver, and composition layer for the ExtendScript toolkit.
 
 </td>
 </tr>
